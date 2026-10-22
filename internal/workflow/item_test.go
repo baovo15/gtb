@@ -121,6 +121,28 @@ func TestBeadsItems_StepLabelReplaced(t *testing.T) {
 	}
 }
 
+func TestBeadsItems_SetBranchReplaces(t *testing.T) {
+	stateFile, _ := fakeBD(t, "gt-abc", []string{"gtb:wf:task", "gtb:step:plan", "gtb:branch:polecat/old"})
+	workDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(workDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	items := NewBeadsItems(beads.NewIsolated(workDir))
+	if got, _ := items.Get("gt-abc"); got == nil || got.Branch != "polecat/old" {
+		t.Fatalf("before = %+v", got)
+	}
+	if err := items.SetBranch("gt-abc", "polecat/new"); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(stateFile)
+	if strings.Contains(string(raw), "gtb:branch:polecat/old") || !strings.Contains(string(raw), "gtb:branch:polecat/new") {
+		t.Fatalf("labels = %q", raw)
+	}
+	if got, _ := items.Get("gt-abc"); got.Branch != "polecat/new" {
+		t.Fatalf("after = %+v", got)
+	}
+}
+
 func TestMemItems_Lifecycle(t *testing.T) {
 	items := NewMemItems()
 	it, err := items.Create("gastown", KindFix, "Broken thing", "")
@@ -137,8 +159,11 @@ func TestMemItems_Lifecycle(t *testing.T) {
 	if err := items.SetWaiting(it.ID, "approve"); err != nil {
 		t.Fatal(err)
 	}
+	if err := items.SetBranch(it.ID, "polecat/p1"); err != nil {
+		t.Fatal(err)
+	}
 	got, err := items.Get(it.ID)
-	if err != nil || got.Step != "reproduce" || !got.StepEnteredAt.Equal(at) || got.WaitingForHuman != "approve" {
+	if err != nil || got.Step != "reproduce" || !got.StepEnteredAt.Equal(at) || got.WaitingForHuman != "approve" || got.Branch != "polecat/p1" {
 		t.Fatalf("got = %+v, %v", got, err)
 	}
 	if _, err := items.Create("other", KindTask, "x", ""); err != nil {

@@ -24,6 +24,7 @@ import (
 	"github.com/steveyegge/gastown/internal/telemetry"
 	"github.com/steveyegge/gastown/internal/templates"
 	"github.com/steveyegge/gastown/internal/tmux"
+	"github.com/steveyegge/gastown/internal/workflow"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -954,7 +955,34 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	var convoyInfo *ConvoyInfo // Populated if issue is tracked by a convoy
 	var sourceIssueForNoMerge *beads.Issue
 	var sourceBD *beads.Beads
-	if exitType == ExitCompleted {
+
+	// Gated workflow (gtb): a gated item leaves its polecat through gt done
+	// at every step, but only the merge step submits to the merge queue.
+	gatedHold, err := doneGatedHold(townRoot, rigName, issueID)
+	if err != nil {
+		return err
+	}
+	doneHoldGatedItem = gatedHold
+	defer func() { doneHoldGatedItem = false }()
+
+	if gatedHold {
+		fmt.Printf("%s Gated item %s is not at merge: no merge request submitted\n", style.Bold.Render("→"), issueID)
+		fmt.Printf("  Signaling %s\n", exitType)
+		fmt.Printf("  Branch: %s\n", branch)
+		// Push the branch (never to the default branch, and no MR bead) so
+		// the step's commits survive the polecat's cleanup.
+		if exitType == ExitCompleted && branch != defaultBranch && branch != "master" {
+			if pushErr := g.Push("origin", branch+":"+branch, false); pushErr != nil {
+				pushFailed = true
+				errMsg := fmt.Sprintf("push failed for branch '%s': %v", branch, pushErr)
+				doneErrors = append(doneErrors, errMsg)
+				style.PrintWarning("%s\nCommits exist locally but failed to push. Witness will be notified.", errMsg)
+			} else {
+				doneCleanupStatus = cleanupStatusAfterSuccessfulPush(doneCleanupStatus)
+				fmt.Printf("%s Branch pushed to origin\n", style.Bold.Render("✓"))
+			}
+		}
+	} else if exitType == ExitCompleted {
 		if branch == defaultBranch || branch == "master" {
 			return fmt.Errorf("cannot submit %s/master branch to merge queue", defaultBranch)
 		}
@@ -2096,6 +2124,51 @@ func verifyPushedCommitWithBareFallback(g *git.Git, townRoot, rigName, branch, c
 	return verifyErr
 }
 
+// doneHoldGatedItem is set while runDone handles a gated item that is not at
+// its merge step: updateAgentStateOnDone then keeps the item bead open (the
+// workflow continues at the next step) and only closes the step's molecule.
+var doneHoldGatedItem bool
+
+// doneGatedHold reports whether issueID is a gated workflow item (rig has
+// workflow.gated.enabled and the bead carries gtb:wf:<kind>) whose effective
+// step is not merge. For such an item it evaluates the step gate and, when
+// the gate waits on a human, records that with Items.SetWaiting. Non-gated
+// rigs and beads that are not workflow items return false. A gated item
+// whose evidence store cannot be opened is an error: falling through would
+// submit it to the merge queue without its gates.
+func doneGatedHold(townRoot, rigName, issueID string) (bool, error) {
+	if townRoot == "" || rigName == "" || issueID == "" {
+		return false, nil
+	}
+	rigPath := filepath.Join(townRoot, rigName)
+	cfg, err := workflow.LoadConfig(rigPath)
+	if err != nil || !cfg.Enabled {
+		return false, nil
+	}
+	env, envErr := newWorkflowEnv(nil, rigName)
+	if envErr != nil {
+		if _, err := workflow.NewBeadsItems(beads.New(rigPath)).Get(issueID); err == nil {
+			return false, fmt.Errorf("gated item %s: cannot open the workflow environment: %w", issueID, envErr)
+		}
+		return false, nil
+	}
+	it, err := env.Items.Get(issueID)
+	if err != nil {
+		return false, nil // not a workflow item
+	}
+	if effectiveStep(env, it) == "merge" {
+		return false, nil
+	}
+	if res := workflow.Gate(env, it); res.WaitingForHuman != "" {
+		if err := env.Items.SetWaiting(issueID, res.WaitingForHuman); err != nil {
+			style.PrintWarning("could not record that %s waits for %s: %v", issueID, res.WaitingForHuman, err)
+		} else {
+			fmt.Printf("%s %s waiting for: %s\n", style.Bold.Render("→"), issueID, res.WaitingForHuman)
+		}
+	}
+	return true, nil
+}
+
 // shouldNudgeRefinery reports whether a gt done invocation may wake the
 // refinery. Only COMPLETED exits create an MR bead; DEFERRED and ESCALATED
 // exits (polecats finishing operational tasks with no code changes) must
@@ -2321,7 +2394,22 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
 	// paused for resumption". Close them on DEFERRED so the convoy can advance.
 	isWorkflowStep := strings.Contains(hookedBeadID, "-wfs-")
 
-	if hookedBeadID != "" && (exitType != ExitDeferred || isWorkflowStep) {
+	if hookedBeadID != "" && doneHoldGatedItem {
+		// Gated item before merge: the item stays open for its next step;
+		// only the finished step formula's molecule is closed.
+		hookBd, _, _ := routedIssueBeads(beadsPath, hookedBeadID)
+		if hookBd == nil {
+			hookBd = bd
+		}
+		if hookedBead, err := hookBd.Show(hookedBeadID); err == nil {
+			if att := beads.ParseAttachmentFields(hookedBead); att != nil && att.AttachedMolecule != "" {
+				closeDescendants(hookBd, att.AttachedMolecule)
+				if err := hookBd.ForceCloseWithReason("done", att.AttachedMolecule); err != nil && !errors.Is(err, beads.ErrNotFound) {
+					fmt.Fprintf(os.Stderr, "Warning: couldn't close attached molecule %s: %v\n", att.AttachedMolecule, err)
+				}
+			}
+		}
+	} else if hookedBeadID != "" && (exitType != ExitDeferred || isWorkflowStep) {
 		// BUG FIX (gt-pftz): Close hooked bead unless already terminal (closed/tombstone).
 		// Previously checked hookedBead.Status == StatusHooked, but polecats update
 		// their work bead to in_progress during work. The exact-match check caused

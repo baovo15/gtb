@@ -414,6 +414,9 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		updateAgentMode(targetAgent, params.Mode, hookWorkDir, beadsDir)
 	}
 
+	// Bind a gated workflow item to the polecat's worktree branch (R19).
+	bindGatedItemBranch(townRoot, params.RigName, params.BeadID, spawnInfo.Branch)
+
 	// 11. Start polecat session
 	pane, err := spawnInfo.StartSession()
 	if err != nil {

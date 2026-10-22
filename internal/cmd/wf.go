@@ -170,15 +170,22 @@ type checkoutInfo struct {
 
 func (c checkoutInfo) line() string { return fmt.Sprintf("checkout: %s (%s)\n", c.Dir, c.Branch) }
 
-// requireCheckout resolves the item's worktree from the cwd (R15) and, when
-// env has no Git source yet, attaches one diffing the rig's default branch
-// against the worktree's branch.
-func requireCheckout(env *workflow.GateEnv) (checkoutInfo, error) {
+// requireCheckout resolves the item's worktree from the cwd (R15), checks it
+// is the worktree sling bound to the item (R19: its branch must equal the
+// item's gtb:branch label) and, when env has no Git source yet, attaches one
+// diffing the rig's default branch against the worktree's branch.
+func requireCheckout(env *workflow.GateEnv, it *workflow.Item) (checkoutInfo, error) {
+	if it.Branch == "" {
+		return checkoutInfo{}, fmt.Errorf("item %s has no worktree; sling it to a polecat first", it.ID)
+	}
 	dir, err := workflowCheckoutDir(env.TownRoot, env.Rig)
 	if err != nil {
 		return checkoutInfo{}, err
 	}
 	co := checkoutInfo{Dir: dir, Branch: workflowBranch(dir)}
+	if co.Branch != it.Branch {
+		return checkoutInfo{}, fmt.Errorf("checkout branch %s is not item %s's branch %s", co.Branch, it.ID, it.Branch)
+	}
 	if env.Git == nil {
 		base := "origin/main"
 		if rc, err := rig.LoadRigConfig(filepath.Join(env.TownRoot, env.Rig)); err == nil && rc.DefaultBranch != "" {
@@ -675,7 +682,7 @@ Exit codes: 0 moved, 3 gate refused (reasons printed), 4 step conflict
 		// the item's own worktree, never a shared clone.
 		var co *checkoutInfo
 		if effectiveStep(env, cur) == "fix" {
-			c, err := requireCheckout(&env)
+			c, err := requireCheckout(&env, cur)
 			if err != nil {
 				return nil, err
 			}
@@ -847,10 +854,11 @@ func runSetup(cmd *cobra.Command, o *wfOpts, itemID string, timeout time.Duratio
 	if env, err = o.env(cmd, true); err != nil {
 		return
 	}
-	if _, err = env.Items.Get(itemID); err != nil {
+	it, err := env.Items.Get(itemID)
+	if err != nil {
 		return
 	}
-	if co, err = requireCheckout(&env); err != nil {
+	if co, err = requireCheckout(&env, it); err != nil {
 		return
 	}
 	parent := cmd.Context()

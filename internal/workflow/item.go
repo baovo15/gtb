@@ -21,6 +21,9 @@ type Item struct {
 	Step                   Step
 	StepEnteredAt          time.Time
 	WaitingForHuman        string
+	// Branch is the git branch of the worktree the item was slung to
+	// (gtb:branch:<branch>); empty until sling binds one.
+	Branch string
 }
 
 // Items reads and writes work item workflow state.
@@ -29,6 +32,9 @@ type Items interface {
 	Create(rig string, k Kind, title, parent string) (*Item, error)
 	SetStep(id string, s Step, at time.Time) error
 	SetWaiting(id, reason string) error
+	// SetBranch binds the item to the worktree branch it was slung to,
+	// replacing any previous binding.
+	SetBranch(id, branch string) error
 	List(rig string) ([]*Item, error)
 }
 
@@ -39,14 +45,15 @@ const (
 	labelEntered = "gtb:entered:"
 	labelWaiting = "gtb:waiting:"
 	labelRig     = "gtb:rig:"
+	labelBranch  = "gtb:branch:"
 )
 
 type beadsItems struct{ b *beads.Beads }
 
 // NewBeadsItems returns Items stored on beads as gtb: labels: gtb:wf:<kind>,
 // gtb:step:<step> and gtb:entered:<RFC3339> (each replaced on change),
-// gtb:waiting:<reason> (removed when empty), and gtb:rig:<rig> (used to
-// recover Item.Rig and to filter List).
+// gtb:waiting:<reason> (removed when empty), gtb:branch:<branch> (replaced
+// on change), and gtb:rig:<rig> (used to recover Item.Rig and to filter List).
 func NewBeadsItems(b *beads.Beads) Items { return &beadsItems{b: b} }
 
 func (bi *beadsItems) Get(id string) (*Item, error) {
@@ -142,6 +149,38 @@ func (bi *beadsItems) SetWaiting(id, reason string) error {
 	return nil
 }
 
+func (bi *beadsItems) SetBranch(id, branch string) error {
+	if branch == "" {
+		return fmt.Errorf("workflow: set branch %s: empty branch", id)
+	}
+	issue, err := bi.b.Show(id)
+	if err != nil {
+		return fmt.Errorf("workflow: show %s: %w", id, err)
+	}
+	want := labelBranch + branch
+	opts := beads.UpdateOptions{}
+	have := false
+	for _, l := range issue.Labels {
+		if strings.HasPrefix(l, labelBranch) {
+			if l == want {
+				have = true
+			} else {
+				opts.RemoveLabels = append(opts.RemoveLabels, l)
+			}
+		}
+	}
+	if !have {
+		opts.AddLabels = []string{want}
+	}
+	if len(opts.AddLabels) == 0 && len(opts.RemoveLabels) == 0 {
+		return nil
+	}
+	if err := bi.b.Update(id, opts); err != nil {
+		return fmt.Errorf("workflow: set branch %s: %w", id, err)
+	}
+	return nil
+}
+
 func (bi *beadsItems) List(rig string) ([]*Item, error) {
 	issues, err := bi.b.List(beads.ListOptions{Label: labelRig + rig, Priority: -1})
 	if err != nil {
@@ -172,6 +211,8 @@ func itemFromIssue(is *beads.Issue) *Item {
 			it.WaitingForHuman = strings.TrimPrefix(l, labelWaiting)
 		case strings.HasPrefix(l, labelRig):
 			it.Rig = strings.TrimPrefix(l, labelRig)
+		case strings.HasPrefix(l, labelBranch):
+			it.Branch = strings.TrimPrefix(l, labelBranch)
 		}
 	}
 	return it
@@ -232,6 +273,20 @@ func (m *memItems) SetWaiting(id, reason string) error {
 		return fmt.Errorf("%w: %s", ErrItemNotFound, id)
 	}
 	it.WaitingForHuman = reason
+	return nil
+}
+
+func (m *memItems) SetBranch(id, branch string) error {
+	if branch == "" {
+		return fmt.Errorf("workflow: set branch %s: empty branch", id)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	it, ok := m.items[id]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrItemNotFound, id)
+	}
+	it.Branch = branch
 	return nil
 }
 

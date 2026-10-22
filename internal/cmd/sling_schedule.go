@@ -10,9 +10,11 @@ import (
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/formula"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 	"github.com/steveyegge/gastown/internal/style"
+	"github.com/steveyegge/gastown/internal/workflow"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -239,7 +241,7 @@ func runBatchSchedule(beadIDs []string, rigName, townRoot string) error {
 
 	successCount := 0
 	for _, beadID := range beadIDs {
-		formula := resolveFormula(slingFormula, slingHookRawBead, townRoot, rigName)
+		formula := resolveFormula(slingFormula, slingHookRawBead, townRoot, rigName, beadID)
 		err := scheduleBead(beadID, rigName, ScheduleOptions{
 			Formula:      formula,
 			Args:         slingArgs,
@@ -284,20 +286,27 @@ func resolveRigForBead(townRoot, beadID string) string {
 // resolveFormula determines the formula name from user flags and rig settings.
 // Resolution order:
 //  1. Explicit --formula flag
-//  2. Rig property layers (wisp → bead → system default "mol-polecat-work")
-//  3. Rig settings file (workflow.default_formula in settings/config.json)
-//  4. Hardcoded fallback "mol-polecat-work"
+//  2. Gated workflow item: when the rig has workflow.gated.enabled and bead
+//     itemID carries gtb:wf:<kind>, the step formula gtb-<kind>-<step> (step
+//     from the gtb:step: label), if that formula exists. Any lookup error or
+//     missing label falls through to the layers below.
+//  3. Rig property layers (wisp → bead → system default "mol-polecat-work")
+//  4. Rig settings file (workflow.default_formula in settings/config.json)
+//  5. Hardcoded fallback "mol-polecat-work"
 //
 // The property layers are the primary mechanism, supporting:
 //
 //	gt rig config set <rig> default_formula mol-evolve         # wisp layer
 //	gt rig config set <rig> default_formula mol-evolve --global # bead layer
-func resolveFormula(explicit string, hookRawBead bool, townRoot, rigName string) string {
+func resolveFormula(explicit string, hookRawBead bool, townRoot, rigName, itemID string) string {
 	if hookRawBead {
 		return ""
 	}
 	if explicit != "" {
 		return explicit
+	}
+	if name := gatedStepFormula(townRoot, rigName, itemID); name != "" {
+		return name
 	}
 	// Check rig property layers: wisp → bead → system default (issue gt-y18).
 	if townRoot != "" && rigName != "" {
@@ -317,6 +326,53 @@ func resolveFormula(explicit string, hookRawBead bool, townRoot, rigName string)
 		}
 	}
 	return "mol-polecat-work"
+}
+
+// gatedStepFormula returns gtb-<kind>-<step> for a gated workflow item in a
+// gated rig, or "" when the rig is not gated, the bead cannot be read, it is
+// not a workflow item, or its step has no formula (merge, epic tasks).
+func gatedStepFormula(townRoot, rigName, itemID string) string {
+	if townRoot == "" || rigName == "" || itemID == "" {
+		return ""
+	}
+	rigPath := filepath.Join(townRoot, rigName)
+	cfg, err := workflow.LoadConfig(rigPath)
+	if err != nil || !cfg.Enabled {
+		return ""
+	}
+	it, err := workflow.NewBeadsItems(beads.New(rigPath)).Get(itemID)
+	if err != nil || it.Kind == "" || it.Step == "" {
+		return ""
+	}
+	name := fmt.Sprintf("gtb-%s-%s", it.Kind, it.Step)
+	if _, err := formula.ResolveFormulaContent(name, townRoot, rigName); err != nil {
+		return ""
+	}
+	return name
+}
+
+// bindGatedItemBranch records gtb:branch:<branch> on a gated workflow item
+// slung to a fresh polecat (R19), so the git-dependent workflow commands only
+// accept that polecat's worktree. Non-gated rigs and non-workflow beads are
+// left alone; failures are warnings (sling has already spawned the polecat).
+func bindGatedItemBranch(townRoot, rigName, beadID, branch string) {
+	if townRoot == "" || rigName == "" || beadID == "" || branch == "" {
+		return
+	}
+	rigPath := filepath.Join(townRoot, rigName)
+	cfg, err := workflow.LoadConfig(rigPath)
+	if err != nil || !cfg.Enabled {
+		return
+	}
+	items := workflow.NewBeadsItems(beads.New(rigPath))
+	if _, err := items.Get(beadID); err != nil {
+		return // not a workflow item
+	}
+	if err := items.SetBranch(beadID, branch); err != nil {
+		fmt.Printf("%s Could not bind %s to branch %s: %v\n", style.Dim.Render("Warning:"), beadID, branch, err)
+		return
+	}
+	fmt.Printf("%s Bound gated item %s to branch %s\n", style.Bold.Render("✓"), beadID, branch)
 }
 
 // areScheduled returns a set of bead IDs that have open sling contexts.

@@ -97,6 +97,15 @@ func newItemID(t *testing.T, kind, title string) string {
 	return v.ID
 }
 
+// bindBranch binds item id to the fake checkout's branch ("polecat/x"), as
+// sling does when it spawns the item's polecat (R19).
+func bindBranch(t *testing.T, w *wfTestEnv, id string) {
+	t.Helper()
+	if err := w.env.Items.SetBranch(id, "polecat/x"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type conflictStore struct{ workflow.Store }
 
 func (conflictStore) Transition(string, workflow.Step, workflow.Step, string) error {
@@ -431,8 +440,9 @@ func TestVerdictCmd_Records(t *testing.T) {
 }
 
 func TestRedCmd_NonMatchingGlob(t *testing.T) {
-	useMemWorkflowEnv(t)
+	w := useMemWorkflowEnv(t)
 	id := newItemID(t, "task", "x")
+	bindBranch(t, w, id)
 	_, errOut, code := runWF(t, "red", id, "step-1", "--tests", "nope/*_test.go", "--", "go", "test")
 	if code != 1 || !strings.Contains(errOut, `--tests glob "nope/*_test.go" matched no files`) {
 		t.Fatalf("exit %d %q", code, errOut)
@@ -454,6 +464,7 @@ func (s *scriptRunner) Run(_ context.Context, _ string, argv []string) (int, str
 func TestRedGreenCmd_Flow(t *testing.T) {
 	w := useMemWorkflowEnv(t)
 	id := newItemID(t, "task", "x")
+	bindBranch(t, w, id)
 	if err := os.WriteFile(filepath.Join(w.checkout, "a_test.go"), []byte("package a\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -485,6 +496,7 @@ func TestRedGreenCmd_Flow(t *testing.T) {
 func TestCheckCmd_NotApproved(t *testing.T) {
 	w := useMemWorkflowEnv(t)
 	id := newItemID(t, "task", "x")
+	bindBranch(t, w, id)
 	w.env.Config.CheckCommands = []string{"true"}
 	out, _, code := runWF(t, "check", id)
 	if code != 3 || !strings.Contains(out, "waiting for: approve check commands") {
@@ -589,6 +601,8 @@ func TestGitCommands_RequireWorktree(t *testing.T) {
 	// artifact dirs inside a worktree).
 	id := newItemID(t, "task", "x")
 	fix := newItemID(t, "fix", "f")
+	bindBranch(t, w, id)
+	bindBranch(t, w, fix)
 	rigPath := filepath.Join(w.env.TownRoot, "r1")
 	gitInit(t, rigPath)
 	mayor := filepath.Join(rigPath, "mayor", "rig")
@@ -650,6 +664,62 @@ func TestGitCommands_RequireWorktree(t *testing.T) {
 	out, errOut, code := runWF(t, "advance", fix, "--json")
 	if code != 3 || !strings.Contains(out, `"checkout"`) {
 		t.Errorf("advance at fix from polecat: exit %d %q %q", code, out, errOut)
+	}
+}
+
+// TestGitCommands_RequireItemBranch (R19): git-dependent commands refuse an
+// item with no bound worktree branch, and a checkout on a different branch.
+func TestGitCommands_RequireItemBranch(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	w.env.Config.CheckCommands = []string{"true"}
+	w.env.Config.CheckCommandsApprovedSHA = workflow.CheckCommandsSHA(w.env.Config.CheckCommands)
+	if err := os.WriteFile(filepath.Join(w.checkout, "a_test.go"), []byte("package a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := &scriptRunner{}
+	oldRunner := workflowRunner
+	workflowRunner = func(workflow.GateEnv, string) workflow.Runner { return r }
+	t.Cleanup(func() { workflowRunner = oldRunner })
+	id := newItemID(t, "task", "x")
+	fix := newItemID(t, "fix", "f")
+	for _, tr := range [][2]workflow.Step{{"report", "reproduce"}, {"reproduce", "rca"}, {"rca", "fix"}} {
+		if err := w.env.Store.Transition(fix, tr[0], tr[1], "t"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmds := func() [][]string {
+		return [][]string{
+			{"red", id, "step-1", "--tests", "*_test.go", "--", "go", "test"},
+			{"green", id, "step-1"},
+			{"check", id},
+			{"advance", fix},
+		}
+	}
+
+	for _, args := range cmds() {
+		item := args[1]
+		_, errOut, code := runWF(t, args...)
+		want := "item " + item + " has no worktree; sling it to a polecat first"
+		if code != 1 || !strings.Contains(errOut, want) {
+			t.Errorf("no branch %v: exit %d %q, want %q", args[0], code, errOut, want)
+		}
+	}
+
+	for _, it := range []string{id, fix} {
+		if err := w.env.Items.SetBranch(it, "polecat/other"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, args := range cmds() {
+		item := args[1]
+		_, errOut, code := runWF(t, args...)
+		want := "checkout branch polecat/x is not item " + item + "'s branch polecat/other"
+		if code != 1 || !strings.Contains(errOut, want) {
+			t.Errorf("wrong branch %v: exit %d %q, want %q", args[0], code, errOut, want)
+		}
+	}
+	if len(r.calls) != 0 {
+		t.Fatalf("runner called for a refused checkout: %v", r.calls)
 	}
 }
 
