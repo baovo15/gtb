@@ -488,7 +488,7 @@ func newItemNewCmd() *cobra.Command {
 		step := workflow.Steps(kind)[0]
 		name := workflow.ArtifactFor(kind, step)
 		path := workflow.ArtifactPath(env.TownRoot, env.Rig, it.ID, name)
-		if err := writeStub(path, it.ID, parent, kind, title); err != nil {
+		if err := workflow.WriteStub(path, it.ID, parent, kind, title); err != nil {
 			return nil, fmt.Errorf("item %s created but stub not written: %w", it.ID, err)
 		}
 		return &wfResult{
@@ -515,29 +515,6 @@ func nearestExisting(p string) string {
 		}
 		p = parent
 	}
-}
-
-// writeStub creates the first-step artifact (never overwriting a file),
-// creating parent directories with mode 0700.
-func writeStub(path, id, parent string, kind workflow.Kind, title string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "---\nid: %s\nstatus: draft\n", id)
-	if parent != "" {
-		fmt.Fprintf(&b, "parent: %s\n", parent)
-	}
-	fmt.Fprintf(&b, "kind: %s\n---\n# %s\n", kind, title)
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return err
-	}
-	if _, err := f.WriteString(b.String()); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
 }
 
 type artifactJSON struct {

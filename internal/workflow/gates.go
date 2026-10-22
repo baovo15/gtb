@@ -19,9 +19,10 @@ type ChangedFiles interface {
 	Changed(itemID string) ([]string, error)
 }
 
-// Observer receives workflow events. Advance emits kind "transition" with a
-// Transition value after each recorded transition. Implementations live
-// outside this package and adapt the workflow-local types.
+// Observer receives workflow events: EventTransition with a Transition after
+// each recorded transition (Advance), and EventEvidence with the TDDRun,
+// CheckRun or Approval just recorded. Implementations live outside this
+// package and adapt the workflow-local types; they must not fail the caller.
 type Observer interface {
 	OnEvent(kind, itemID string, data any)
 }

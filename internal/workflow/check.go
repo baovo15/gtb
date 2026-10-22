@@ -51,6 +51,7 @@ func Check(env GateEnv, r Runner, itemID, dir string) (CheckRun, error) {
 	if err := env.Store.AddCheck(run); err != nil {
 		return CheckRun{}, err
 	}
+	env.emit(EventEvidence, itemID, run)
 	return run, nil
 }
 

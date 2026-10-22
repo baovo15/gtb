@@ -51,9 +51,7 @@ func Advance(env GateEnv, itemID, actor string) (*Item, GateResult, error) {
 			tr = last
 		}
 	}
-	if env.Observer != nil {
-		env.Observer.OnEvent("transition", itemID, tr)
-	}
+	env.emit(EventTransition, itemID, tr)
 
 	it.Step, it.StepEnteredAt = next, tr.At
 	if err := env.Items.SetStep(itemID, next, tr.At); err != nil {

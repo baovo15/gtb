@@ -163,6 +163,7 @@ func Red(env GateEnv, r Runner, itemID, planStep, dir string, argv []string, tes
 	if err := env.Store.AddTDD(run); err != nil {
 		return TDDRun{}, err
 	}
+	env.emit(EventEvidence, itemID, run)
 	return run, refused
 }
 
@@ -219,6 +220,7 @@ func Green(env GateEnv, r Runner, itemID, planStep, dir string) (TDDRun, error) 
 	if err := env.Store.AddTDD(run); err != nil {
 		return TDDRun{}, err
 	}
+	env.emit(EventEvidence, itemID, run)
 	return run, refused
 }
 

@@ -51,8 +51,8 @@ var artifactNameRe = regexp.MustCompile(`^[a-z][a-z0-9_-]*$`)
 // currentArtifactSHA returns the hash of item itemID's artifact as it is on
 // disk now. A missing file or an invalid name is an error.
 func currentArtifactSHA(env GateEnv, itemID, artifact string) (string, error) {
-	if !artifactNameRe.MatchString(artifact) {
-		return "", fmt.Errorf("workflow: invalid artifact name %q", artifact)
+	if err := ValidateArtifactName(artifact); err != nil {
+		return "", err
 	}
 	_, sha, _, err := ReadArtifact(ArtifactPath(env.TownRoot, env.Rig, itemID, artifact))
 	return sha, err
@@ -108,6 +108,7 @@ func HumanApprove(env GateEnv, t Terminal, getenv func(string) string, itemID, a
 	if err := env.Store.AddApproval(a); err != nil {
 		return Approval{}, err
 	}
+	env.emit(EventEvidence, itemID, a)
 	return a, nil
 }
 
@@ -139,6 +140,7 @@ func RecordVerdict(env GateEnv, itemID, artifact, role, verdict, actor string) (
 	if err := env.Store.AddApproval(a); err != nil {
 		return Approval{}, err
 	}
+	env.emit(EventEvidence, itemID, a)
 	return a, nil
 }
 
