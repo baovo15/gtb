@@ -1,0 +1,285 @@
+// This file holds one-time machine enrollment (spec §8): enrollment codes,
+// the POST /agent/v1/enroll handler and its brute-force limiter.
+package server
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base32"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/steveyegge/gastown/internal/agentlink"
+)
+
+// DefaultEnrollCodeTTL is the lifetime of an enrollment code created with a
+// non-positive ttl.
+const DefaultEnrollCodeTTL = 15 * time.Minute
+
+const (
+	enrollMaxBody     = 64 << 10
+	enrollMaxFailures = 10
+	enrollFailWindow  = 15 * time.Minute
+)
+
+// errInvalidCode is returned by consumeEnrollCode for an unknown, used or
+// expired code. The three cases are deliberately indistinguishable.
+var errInvalidCode = errors.New("server: invalid enrollment code")
+
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+func randomBytes(n int) ([]byte, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// CreateEnrollCode creates a single-use enrollment code and returns it. The
+// code is 128 bits from crypto/rand, uppercase base32 without padding. Only
+// its sha256 is stored, so the returned value is the only copy. A ttl <= 0
+// means DefaultEnrollCodeTTL.
+func (s *Store) CreateEnrollCode(ttl time.Duration) (string, error) {
+	if ttl <= 0 {
+		ttl = DefaultEnrollCodeTTL
+	}
+	b, err := randomBytes(16)
+	if err != nil {
+		return "", fmt.Errorf("server: generate enroll code: %w", err)
+	}
+	code := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)
+	now := time.Now()
+	if _, err := s.db.Exec(`INSERT INTO enroll_codes(sha, created_at, expires_at) VALUES (?, ?, ?)`,
+		sha256Hex(code), ms(now), ms(now.Add(ttl))); err != nil {
+		return "", fmt.Errorf("server: store enroll code: %w", err)
+	}
+	return code, nil
+}
+
+// consumeEnrollCode atomically marks code used by machineID and, in the same
+// transaction, registers the machine and its token. It returns errInvalidCode
+// when the code is unknown, already used or expired at now.
+func (s *Store) consumeEnrollCode(code, machineID, tokenSHA string, h agentlink.Hello, now time.Time) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("server: enroll: %w", err)
+	}
+	defer tx.Rollback()
+	t := ms(now)
+	res, err := tx.Exec(`UPDATE enroll_codes SET used_at = ?, machine_id = ?
+		WHERE sha = ? AND used_at IS NULL AND expires_at > ?`,
+		t, machineID, sha256Hex(code), t)
+	if err != nil {
+		return fmt.Errorf("server: consume enroll code: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("server: consume enroll code: %w", err)
+	}
+	if n != 1 {
+		return errInvalidCode
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO machines(id, hostname, os, arch, gtb_version, protocol, created_at, last_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		machineID, h.Hostname, h.OS, h.Arch, h.GtbVersion, h.Protocol, t, t); err != nil {
+		return fmt.Errorf("server: enroll machine: %w", err)
+	}
+	if _, err := tx.Exec(`INSERT INTO tokens(sha, machine_id, created_at) VALUES (?, ?, ?)`,
+		tokenSHA, machineID, t); err != nil {
+		return fmt.Errorf("server: enroll token: %w", err)
+	}
+	return tx.Commit()
+}
+
+// EnrollRequest is the body of POST /agent/v1/enroll.
+type EnrollRequest struct {
+	Code  string          `json:"code"`
+	Hello agentlink.Hello `json:"hello"`
+}
+
+// EnrollResponse is the success body of POST /agent/v1/enroll. Token is
+// returned exactly once; the server keeps only its sha256.
+type EnrollResponse struct {
+	MachineID string `json:"machine_id"`
+	Token     string `json:"token"`
+}
+
+// EnrollHandler returns the handler for POST /agent/v1/enroll. now is the
+// clock used for code expiry and the failure limiter. The handler never logs
+// codes or tokens.
+func (s *Store) EnrollHandler(now func() time.Time) http.Handler {
+	if now == nil {
+		now = time.Now
+	}
+	return &enrollAPI{store: s, now: now, limiter: newFailureLimiter(enrollMaxFailures, enrollFailWindow)}
+}
+
+type enrollAPI struct {
+	store   *Store
+	now     func() time.Time
+	limiter *failureLimiter
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, code string) {
+	writeJSON(w, status, map[string]string{"error": code})
+}
+
+func (a *enrollAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	ip := remoteIP(r.RemoteAddr)
+	now := a.now()
+	if !a.limiter.allow(ip, now) {
+		writeError(w, http.StatusTooManyRequests, "too_many_attempts")
+		return
+	}
+
+	var req EnrollRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, enrollMaxBody))
+	if err := dec.Decode(&req); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeError(w, http.StatusRequestEntityTooLarge, "body_too_large")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "bad_request")
+		return
+	}
+	if !sameProtocolMajor(req.Hello.Protocol, agentlink.ProtocolVersion) {
+		writeError(w, http.StatusBadRequest, "protocol_mismatch")
+		return
+	}
+
+	idBytes, err := randomBytes(16)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	tokBytes, err := randomBytes(32)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	machineID := hex.EncodeToString(idBytes)
+	token := base64.RawURLEncoding.EncodeToString(tokBytes)
+	hello := req.Hello
+	hello.MachineID = machineID // the server assigns identity; ignore the client's
+
+	err = a.store.consumeEnrollCode(req.Code, machineID, sha256Hex(token), hello, now)
+	if errors.Is(err, errInvalidCode) {
+		a.limiter.fail(ip, now)
+		writeError(w, http.StatusUnauthorized, "invalid_code")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	writeJSON(w, http.StatusOK, EnrollResponse{MachineID: machineID, Token: token})
+}
+
+// sameProtocolMajor reports whether two dotted versions share a non-empty
+// numeric major component.
+func sameProtocolMajor(got, want string) bool {
+	major := func(v string) string {
+		m, _, _ := strings.Cut(v, ".")
+		if m == "" {
+			return ""
+		}
+		for _, c := range m {
+			if c < '0' || c > '9' {
+				return ""
+			}
+		}
+		return m
+	}
+	g := major(got)
+	return g != "" && g == major(want)
+}
+
+// remoteIP strips the port from an http.Request.RemoteAddr.
+func remoteIP(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
+}
+
+// failureLimiter allows at most max failures per key within window. State is
+// in memory and resets on restart.
+type failureLimiter struct {
+	mu        sync.Mutex
+	max       int
+	window    time.Duration
+	failures  map[string][]time.Time
+	lastSweep time.Time
+}
+
+func newFailureLimiter(max int, window time.Duration) *failureLimiter {
+	return &failureLimiter{max: max, window: window, failures: map[string][]time.Time{}}
+}
+
+// prune drops failures for key at or before now-window. Caller holds mu.
+func (l *failureLimiter) prune(key string, now time.Time) []time.Time {
+	cutoff := now.Add(-l.window)
+	fs := l.failures[key]
+	i := 0
+	for i < len(fs) && !fs[i].After(cutoff) {
+		i++
+	}
+	fs = fs[i:]
+	if len(fs) == 0 {
+		delete(l.failures, key)
+		return nil
+	}
+	l.failures[key] = fs
+	return fs
+}
+
+// sweep prunes every key at most once per window, bounding memory to keys
+// with recent failures. Caller holds mu.
+func (l *failureLimiter) sweep(now time.Time) {
+	if now.Sub(l.lastSweep) < l.window {
+		return
+	}
+	l.lastSweep = now
+	for k := range l.failures {
+		l.prune(k, now)
+	}
+}
+
+func (l *failureLimiter) allow(key string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.sweep(now)
+	return len(l.prune(key, now)) < l.max
+}
+
+func (l *failureLimiter) fail(key string, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.failures[key] = append(l.prune(key, now), now)
+}
