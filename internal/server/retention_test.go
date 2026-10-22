@@ -66,7 +66,7 @@ func TestPrune_RequestsAndResults(t *testing.T) {
 		t.Fatalf("pruned = %d, want 3", n)
 	}
 	for _, k := range []string{"pend-old", "new"} {
-		if st, _, err := s.RequestStatus("m1", k); err != nil || st != "pending" {
+		if st, _, err := s.RequestStatus("m1", k, now); err != nil || st != "pending" {
 			t.Fatalf("%s: %q %v", k, st, err)
 		}
 	}

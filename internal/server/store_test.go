@@ -280,7 +280,8 @@ func TestRequests_ExpiredNotDelivered(t *testing.T) {
 	s := openTest(t)
 	addMachine(t, s, "m1")
 	now := time.Now()
-	if err := s.EnqueueRequest("m1", agentlink.Request{Key: "old", Type: "snapshot", ExpiresAt: now.Add(-time.Second)}); err != nil {
+	// Enqueued 2 s ago with a 1 s lifetime: expired 1 s ago.
+	if err := s.enqueueRequest("m1", agentlink.Request{Key: "old", Type: "snapshot", ExpiresAt: now.Add(-time.Second)}, now.Add(-2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.EnqueueRequest("m1", agentlink.Request{Key: "new", Type: "approve", ItemID: "gt-1", Params: mustJSON(t, agentlink.ApproveParams{Artifact: "spec", SHA: "abc", Actor: "baovo15"}), ExpiresAt: now.Add(time.Hour)}); err != nil {
@@ -305,7 +306,7 @@ func TestRequests_ExpiredNotDelivered(t *testing.T) {
 	if err != nil || n != 1 {
 		t.Fatalf("expired n=%d err=%v", n, err)
 	}
-	st, res, err := s.RequestStatus("m1", "old")
+	st, res, err := s.RequestStatus("m1", "old", now)
 	if err != nil || st != "expired" || res != nil {
 		t.Fatalf("status=%q res=%v err=%v", st, res, err)
 	}
@@ -319,7 +320,7 @@ func TestResults_DoneAndStatus(t *testing.T) {
 	addMachine(t, s, "m1")
 	now := time.Now()
 	s.EnqueueRequest("m1", agentlink.Request{Key: "k1", Type: "inspect", ExpiresAt: now.Add(time.Hour)})
-	st, res, err := s.RequestStatus("m1", "k1")
+	st, res, err := s.RequestStatus("m1", "k1", now)
 	if err != nil || st != "pending" || res != nil {
 		t.Fatalf("status=%q res=%v err=%v", st, res, err)
 	}
@@ -330,18 +331,21 @@ func TestResults_DoneAndStatus(t *testing.T) {
 	if err := s.AddResult("m1", agentlink.Result{Key: "k1", OK: true}); err != nil {
 		t.Fatal(err)
 	}
-	st, res, err = s.RequestStatus("m1", "k1")
+	st, res, err = s.RequestStatus("m1", "k1", now)
 	if err != nil || st != "done" || res == nil || res.OK || res.Error != "sha changed" || string(res.Data) != `{"a":1}` {
 		t.Fatalf("status=%q res=%+v err=%v", st, res, err)
 	}
 	if pend, _ := s.PendingRequests("m1", now); len(pend) != 0 {
 		t.Fatalf("pending after result = %+v", pend)
 	}
-	// A result that arrives after expiry still keeps the request out of expiry.
+	// An on-time result keeps the request done, even after expires_at passes.
 	if n, _ := s.ExpireRequests(now.Add(2 * time.Hour)); n != 0 {
 		t.Fatalf("expired done request: %d", n)
 	}
-	if _, _, err := s.RequestStatus("m1", "nope"); !errors.Is(err, ErrNotFound) {
+	if st, _, _ := s.RequestStatus("m1", "k1", now.Add(2*time.Hour)); st != "done" {
+		t.Fatalf("on-time result later read as %q", st)
+	}
+	if _, _, err := s.RequestStatus("m1", "nope", now); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing err = %v", err)
 	}
 }
@@ -373,5 +377,92 @@ func TestAppendEvents_UnknownTypeRejected(t *testing.T) {
 	s.db.QueryRow(`SELECT count(*) FROM events`).Scan(&n)
 	if n != 0 {
 		t.Fatalf("partial batch stored: %d", n)
+	}
+}
+
+// R32: a result recorded after the request expired is stored for audit but
+// leaves the request expired.
+func TestResults_LateAfterSweep(t *testing.T) {
+	s := openTest(t)
+	addMachine(t, s, "m1")
+	now := time.Now()
+	if err := s.enqueueRequest("m1", agentlink.Request{Key: "k", Type: "approve", ExpiresAt: now.Add(time.Second)}, now); err != nil {
+		t.Fatal(err)
+	}
+	later := now.Add(time.Minute)
+	if n, _ := s.ExpireRequests(later); n != 1 {
+		t.Fatalf("expired = %d", n)
+	}
+	if err := s.addResult("m1", agentlink.Result{Key: "k", OK: true, Data: json.RawMessage(`{"late":true}`)}, later); err != nil {
+		t.Fatal(err)
+	}
+	st, res, err := s.RequestStatus("m1", "k", later)
+	if err != nil || st != "expired" {
+		t.Fatalf("status=%q err=%v", st, err)
+	}
+	if res == nil || !res.OK || string(res.Data) != `{"late":true}` {
+		t.Fatalf("late result not retrievable: %+v", res)
+	}
+}
+
+func TestResults_LateBeforeSweep(t *testing.T) {
+	s := openTest(t)
+	addMachine(t, s, "m1")
+	now := time.Now()
+	s.enqueueRequest("m1", agentlink.Request{Key: "k", Type: "inspect", ExpiresAt: now.Add(time.Second)}, now)
+	// Recorded exactly at expires_at: late.
+	if err := s.addResult("m1", agentlink.Result{Key: "k", OK: true}, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	st, res, err := s.RequestStatus("m1", "k", now.Add(time.Second))
+	if err != nil || st != "expired" || res == nil {
+		t.Fatalf("status=%q res=%v err=%v", st, res, err)
+	}
+	if pend, _ := s.PendingRequests("m1", now); len(pend) != 0 {
+		t.Fatalf("pending = %+v", pend)
+	}
+}
+
+func TestResults_OnTimeDone(t *testing.T) {
+	s := openTest(t)
+	addMachine(t, s, "m1")
+	now := time.Now()
+	s.enqueueRequest("m1", agentlink.Request{Key: "k", Type: "inspect", ExpiresAt: now.Add(time.Second)}, now)
+	if err := s.addResult("m1", agentlink.Result{Key: "k", OK: true}, now.Add(999*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if st, res, err := s.RequestStatus("m1", "k", now.Add(time.Hour)); err != nil || st != "done" || res == nil {
+		t.Fatalf("status=%q res=%v err=%v", st, res, err)
+	}
+}
+
+func TestRequestStatus_ExpiredWithoutSweep(t *testing.T) {
+	s := openTest(t)
+	addMachine(t, s, "m1")
+	now := time.Now()
+	s.enqueueRequest("m1", agentlink.Request{Key: "k", Type: "inspect", ExpiresAt: now.Add(time.Second)}, now)
+	if st, _, _ := s.RequestStatus("m1", "k", now); st != "pending" {
+		t.Fatalf("before expiry = %q", st)
+	}
+	if st, res, err := s.RequestStatus("m1", "k", now.Add(time.Second)); err != nil || st != "expired" || res != nil {
+		t.Fatalf("at expiry status=%q res=%v err=%v", st, res, err)
+	}
+}
+
+func TestEnqueueRequest_InvalidExpiry(t *testing.T) {
+	s := openTest(t)
+	addMachine(t, s, "m1")
+	for name, exp := range map[string]time.Time{
+		"zero": {},
+		"past": time.Now().Add(-time.Second),
+	} {
+		err := s.EnqueueRequest("m1", agentlink.Request{Key: name, Type: "inspect", ExpiresAt: exp})
+		if !errors.Is(err, ErrInvalidExpiry) {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+	now := time.Now()
+	if err := s.enqueueRequest("m1", agentlink.Request{Key: "eq", Type: "inspect", ExpiresAt: now}, now); !errors.Is(err, ErrInvalidExpiry) {
+		t.Errorf("at now: err = %v", err)
 	}
 }

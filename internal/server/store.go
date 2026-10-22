@@ -25,6 +25,10 @@ var ErrNotFound = errors.New("server: not found")
 // agentlink.RequestTypes.
 var ErrUnknownRequestType = errors.New("server: unknown request type")
 
+// ErrInvalidExpiry is returned by EnqueueRequest for a zero ExpiresAt or one
+// at or before now.
+var ErrInvalidExpiry = errors.New("server: invalid request expiry")
+
 // Request statuses.
 const (
 	RequestPending   = "pending"
@@ -610,7 +614,8 @@ func (s *Store) Item(machineID, id string) (*ItemRow, []agentlink.ArtifactView, 
 }
 
 // EnqueueRequest queues r for the machine. Types outside
-// agentlink.RequestTypes fail with ErrUnknownRequestType; a duplicate key is a
+// agentlink.RequestTypes fail with ErrUnknownRequestType, and a zero or
+// non-future ExpiresAt fails with ErrInvalidExpiry. A duplicate key is a
 // no-op.
 func (s *Store) EnqueueRequest(machineID string, r agentlink.Request) error {
 	return s.enqueueRequest(machineID, r, time.Now())
@@ -619,6 +624,9 @@ func (s *Store) EnqueueRequest(machineID string, r agentlink.Request) error {
 func (s *Store) enqueueRequest(machineID string, r agentlink.Request, now time.Time) error {
 	if !agentlink.IsRequestType(r.Type) {
 		return fmt.Errorf("%w: %q", ErrUnknownRequestType, r.Type)
+	}
+	if r.ExpiresAt.IsZero() || !r.ExpiresAt.After(now) {
+		return fmt.Errorf("%w: %v", ErrInvalidExpiry, r.ExpiresAt)
 	}
 	if r.Key == "" {
 		return errors.New("server: enqueue request: empty key")
@@ -667,32 +675,49 @@ func (s *Store) PendingRequests(machineID string, now time.Time) ([]agentlink.Re
 	return out, rows.Err()
 }
 
-// AddResult records a machine's result and marks the request done. It is
-// idempotent: the first result for a key wins. It returns ErrNotFound if the
-// machine has no request with that key.
+// AddResult records a machine's result. It is idempotent: the first result
+// for a key wins. A result is on time when the request is not already expired
+// and its expires_at is after the time the result is recorded; an on-time
+// result marks the request done. A late result is still stored, for audit,
+// but the request becomes (or stays) expired (R32). It returns ErrNotFound if
+// the machine has no request with that key.
 func (s *Store) AddResult(machineID string, r agentlink.Result) error {
 	return s.addResult(machineID, r, time.Now())
 }
 
 func (s *Store) addResult(machineID string, r agentlink.Result, now time.Time) error {
+	at := ms(now)
 	tx, err := s.db.Begin()
 	if err != nil {
 		return fmt.Errorf("server: add result: %w", err)
 	}
 	defer tx.Rollback()
-	res, err := tx.Exec(`UPDATE requests SET status = ? WHERE machine_id = ? AND key = ?`, RequestDone, machineID, r.Key)
+	var status string
+	var expiresAt int64
+	err = tx.QueryRow(`SELECT status, expires_at FROM requests WHERE machine_id = ? AND key = ?`, machineID, r.Key).Scan(&status, &expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
 	if err != nil {
 		return fmt.Errorf("server: add result: %w", err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
 	}
 	var data any
 	if len(r.Data) > 0 {
 		data = string(r.Data)
 	}
-	if _, err := tx.Exec(`INSERT OR IGNORE INTO results(machine_id, key, ok, error, data, at) VALUES (?, ?, ?, ?, ?, ?)`,
-		machineID, r.Key, r.OK, r.Error, data, ms(now)); err != nil {
+	res, err := tx.Exec(`INSERT OR IGNORE INTO results(machine_id, key, ok, error, data, at) VALUES (?, ?, ?, ?, ?, ?)`,
+		machineID, r.Key, r.OK, r.Error, data, at)
+	if err != nil {
+		return fmt.Errorf("server: add result: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return tx.Commit() // duplicate: the first result already decided the status
+	}
+	next := RequestDone
+	if status == RequestExpired || expiresAt <= at {
+		next = RequestExpired
+	}
+	if _, err := tx.Exec(`UPDATE requests SET status = ? WHERE machine_id = ? AND key = ?`, next, machineID, r.Key); err != nil {
 		return fmt.Errorf("server: add result: %w", err)
 	}
 	return tx.Commit()
@@ -713,15 +738,18 @@ func (s *Store) ExpireRequests(now time.Time) (int, error) {
 	return int(n), nil
 }
 
-// RequestStatus returns a request's status and, when one exists, its result.
-func (s *Store) RequestStatus(machineID, key string) (string, *agentlink.Result, error) {
+// RequestStatus returns a request's status at now and, when one exists, its
+// result (late results included). A request with no result whose expires_at
+// is at or before now reads as expired even before ExpireRequests has run.
+func (s *Store) RequestStatus(machineID, key string, now time.Time) (string, *agentlink.Result, error) {
 	var status string
+	var expiresAt int64
 	var ok sql.NullBool
 	var errStr, data sql.NullString
 	err := s.db.QueryRow(`
-		SELECT r.status, x.ok, x.error, x.data FROM requests r
+		SELECT r.status, r.expires_at, x.ok, x.error, x.data FROM requests r
 		LEFT JOIN results x ON x.machine_id = r.machine_id AND x.key = r.key
-		WHERE r.machine_id = ? AND r.key = ?`, machineID, key).Scan(&status, &ok, &errStr, &data)
+		WHERE r.machine_id = ? AND r.key = ?`, machineID, key).Scan(&status, &expiresAt, &ok, &errStr, &data)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil, ErrNotFound
 	}
@@ -729,6 +757,9 @@ func (s *Store) RequestStatus(machineID, key string) (string, *agentlink.Result,
 		return "", nil, fmt.Errorf("server: request status: %w", err)
 	}
 	if !ok.Valid {
+		if (status == RequestPending || status == RequestDelivered) && expiresAt <= ms(now) {
+			status = RequestExpired
+		}
 		return status, nil, nil
 	}
 	res := &agentlink.Result{Key: key, OK: ok.Bool, Error: errStr.String}
