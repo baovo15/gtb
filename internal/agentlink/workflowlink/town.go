@@ -65,7 +65,7 @@ func (t *Town) Rigs() ([]agentlink.Rig, error) {
 	}
 	var out []agentlink.Rig
 	for name, e := range rc.Rigs {
-		r := agentlink.Rig{Name: name, Remote: e.GitURL}
+		r := agentlink.Rig{Name: name, Remote: RedactRemote(e.GitURL)}
 		if rigNameRe.MatchString(name) {
 			if cfg, err := workflow.LoadConfig(filepath.Join(t.Root, name)); err == nil && cfg.Enabled {
 				r.Gated = true

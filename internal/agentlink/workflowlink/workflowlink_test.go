@@ -427,3 +427,78 @@ func TestParseNumStat(t *testing.T) {
 		}
 	}
 }
+
+// R34: git URLs from rigs.json never carry credentials to the server.
+func TestRedactRemote(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://u:tok@host/r.git":          "https://host/r.git",
+		"https://tok@host/r.git":            "https://host/r.git",
+		"https://host/r.git?token=x":        "https://host/r.git",
+		"https://u:p@host/r.git?t=x#frag":   "https://host/r.git",
+		"git@host:o/r.git":                  "git@host:o/r.git",
+		"ssh://git@host/o/r.git":            "ssh://host/o/r.git",
+		"/srv/repos/r.git":                  "/srv/repos/r.git",
+		"":                                  "",
+		"https://u:tok@host/%zz":            "",
+		"not a url but has user:pw@host x?": "",
+	} {
+		if got := RedactRemote(in); got != want {
+			t.Errorf("RedactRemote(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestTownRigs_RemoteRedacted(t *testing.T) {
+	town := t.TempDir()
+	os.MkdirAll(filepath.Join(town, "mayor"), 0o755)
+	os.WriteFile(filepath.Join(town, "mayor", "rigs.json"), []byte(`{"version":1,"rigs":{
+		"a":{"git_url":"https://u:tok@host/a.git"},
+		"b":{"git_url":"https://host/b.git?token=x"},
+		"c":{"git_url":"git@host:o/c.git"}}}`), 0o644)
+	rigs, err := NewTown(town, nil).Rigs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, r := range rigs {
+		got[r.Name] = r.Remote
+	}
+	want := map[string]string{"a": "https://host/a.git", "b": "https://host/b.git", "c": "git@host:o/c.git"}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("rigs = %v, want %v", got, want)
+		}
+	}
+	b, _ := json.Marshal(rigs)
+	if strings.Contains(string(b), "tok") {
+		t.Fatalf("credential leaked: %s", b)
+	}
+}
+
+// R34: free-form error text sent in Result.Data (sling/cancel output, git
+// errors) has credentials stripped from any URL it contains.
+func TestRedactText(t *testing.T) {
+	in := "push failed: fatal: unable to access 'https://x-access-token:ghp_SECRET@github.com/o/r.git/': 403\n" +
+		"remote: see https://host/p?token=SECRET2&x=1 and git@host:o/r.git"
+	got := RedactText(in)
+	if strings.Contains(got, "SECRET") {
+		t.Fatalf("secret kept: %q", got)
+	}
+	for _, keep := range []string{"https://github.com/o/r.git/", "https://host/p", "git@host:o/r.git", "403"} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("%q missing from %q", keep, got)
+		}
+	}
+}
+
+func TestApply_FailedSlingOutputRedacted(t *testing.T) {
+	f := newFixture(t)
+	id, _ := f.item(t, "x\n")
+	f.app.Sling = func(context.Context, string, string) error {
+		return errors.New("gtb sling: exit status 1: fatal: could not read from 'https://bot:ghp_SECRET@github.com/o/r.git'")
+	}
+	res := f.app.Apply(context.Background(), req("item.sling", id, nil))
+	if res.OK || strings.Contains(string(res.Data), "SECRET") || !strings.Contains(string(res.Data), "github.com/o/r.git") {
+		t.Fatalf("result = %s", res.Data)
+	}
+}

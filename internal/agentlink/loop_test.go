@@ -34,7 +34,8 @@ type loopFixture struct {
 	town  string
 	now   time.Time
 
-	failFirst atomic.Int32 // remaining calls to answer 503
+	failFirst   atomic.Int32 // remaining calls to answer 503
+	failResults atomic.Int32 // remaining POST /results calls to answer 503
 
 	mu        sync.Mutex
 	calls     []string // path of every call that reached the API
@@ -61,6 +62,11 @@ func newLoopFixture(t *testing.T) *loopFixture {
 	}
 	api := server.NewAgentAPI(st, func() time.Time { return f.now })
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/agent/v1/results" && f.failResults.Load() > 0 {
+			f.failResults.Add(-1)
+			http.Error(w, `{"error":"unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
 		if f.failFirst.Load() > 0 {
 			f.failFirst.Add(-1)
 			http.Error(w, `{"error":"unavailable"}`, http.StatusServiceUnavailable)
@@ -618,5 +624,119 @@ func TestAgentLoop_RejectedBatchDoesNotWedge(t *testing.T) {
 	stop()
 	if !strings.Contains(logs.String(), "dropped 1 event") {
 		t.Fatalf("log = %s", logs.String())
+	}
+}
+
+// R35a: a request that was applied, but whose result never reached the
+// server, is re-delivered; even after ExpiresAt the stored result (not
+// "expired") is re-posted, and it is not applied again.
+func TestAgentLoop_AppliedThenExpiredRepostsStoredResult(t *testing.T) {
+	f := newLoopFixture(t)
+	wall := time.Now().UTC()
+	f.now = wall
+	enqueue(t, f, agentlink.Request{Key: "k-ran", Type: "item.sling", ItemID: "gt-1", ExpiresAt: wall.Add(time.Hour)})
+	f.failResults.Store(1) // the first results POST is lost
+	var clock atomic.Int64
+	clock.Store(wall.UnixNano())
+	app := &countingApplier{fn: func(r agentlink.Request) agentlink.Result {
+		clock.Store(wall.Add(2 * time.Hour).UnixNano()) // time passes past ExpiresAt
+		return agentlink.Result{Key: r.Key, OK: true, Data: json.RawMessage(`{"ran":true}`)}
+	}}
+	cfg := f.config(app, &logBuf{})
+	cfg.Now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	stop := run(t, cfg)
+	eventually(t, "result posted", func() bool { return resultFor(t, f, "k-ran") != nil })
+	stop()
+	if app.count() != 1 {
+		t.Fatalf("applied %d times", app.count())
+	}
+	if r := resultFor(t, f, "k-ran"); !r.OK || string(r.Data) != `{"ran":true}` {
+		t.Fatalf("result = %+v, want the stored result", r)
+	}
+}
+
+// R35b: backoff resets only after a full productive round; a session that
+// says hello but then keeps failing (here: Collect) backs off further.
+func TestAgentLoop_BackoffGrowsWhenRoundsFail(t *testing.T) {
+	f := newLoopFixture(t) // no snapshot yet: hello says resync
+	var mu sync.Mutex
+	var attempts []time.Time
+	cfg := f.config(&countingApplier{}, &logBuf{})
+	cfg.BackoffMin, cfg.BackoffMax = 20*time.Millisecond, 400*time.Millisecond
+	cfg.Collect = func() (agentlink.Snapshot, error) {
+		mu.Lock()
+		attempts = append(attempts, time.Now())
+		mu.Unlock()
+		return agentlink.Snapshot{}, errors.New("dolt down")
+	}
+	stop := run(t, cfg)
+	eventually(t, "6 attempts", func() bool { mu.Lock(); defer mu.Unlock(); return len(attempts) >= 6 })
+	stop()
+	mu.Lock()
+	defer mu.Unlock()
+	// Jitter is [d/2, d]: with doubling from 20ms, the 5th gap is >= 160ms.
+	if gap := attempts[5].Sub(attempts[4]); gap < 150*time.Millisecond {
+		t.Fatalf("backoff did not grow: gaps %v", gaps(attempts))
+	}
+}
+
+func gaps(ts []time.Time) []time.Duration {
+	var out []time.Duration
+	for i := 1; i < len(ts); i++ {
+		out = append(out, ts[i].Sub(ts[i-1]).Round(time.Millisecond))
+	}
+	return out
+}
+
+// R35c: read-only requests keep only {ok, error} in the applied set; mutating
+// requests keep the full result.
+func TestAgentLoop_AppliedSetStoresOnlyMutatingResults(t *testing.T) {
+	f := newLoopFixture(t)
+	f.now = time.Now().UTC()
+	for _, typ := range []string{"inspect", "terminal.peek", "snapshot", "approve", "item.create"} {
+		enqueue(t, f, agentlink.Request{Key: "k-" + typ, Type: typ, ItemID: "gt-1", ExpiresAt: f.now.Add(time.Hour)})
+	}
+	app := &countingApplier{fn: func(r agentlink.Request) agentlink.Result {
+		return agentlink.Result{Key: r.Key, OK: true, Data: json.RawMessage(`{"big":"` + strings.Repeat("z", 1000) + `"}`)}
+	}}
+	stop := run(t, f.config(app, &logBuf{}))
+	eventually(t, "results", func() bool { return resultFor(t, f, "k-item.create") != nil && resultFor(t, f, "k-inspect") != nil })
+	stop()
+	// The server still got the full read-only result.
+	if r := resultFor(t, f, "k-inspect"); !r.OK || len(r.Data) < 1000 {
+		t.Fatalf("inspect result posted = %+v", r)
+	}
+	set, _ := agentlink.OpenAppliedSet(f.town, 100)
+	for _, typ := range []string{"inspect", "terminal.peek", "snapshot"} {
+		r, ok := set.Get("k-" + typ)
+		if !ok || !r.OK || (len(r.Data) != 0 && string(r.Data) != "null") {
+			t.Fatalf("%s stored = %+v %v, want {ok} without data", typ, r, ok)
+		}
+	}
+	for _, typ := range []string{"approve", "item.create"} {
+		if r, ok := set.Get("k-" + typ); !ok || len(r.Data) < 1000 {
+			t.Fatalf("%s stored = %+v %v, want full result", typ, r, ok)
+		}
+	}
+}
+
+// R35c: a re-delivered read-only request is re-run (its data is not kept).
+func TestAgentLoop_ReadOnlyRedeliveryReruns(t *testing.T) {
+	f := newLoopFixture(t)
+	f.now = time.Now().UTC()
+	applied, _ := agentlink.OpenAppliedSet(f.town, 100)
+	applied.Put(agentlink.Result{Key: "k-peek", OK: true}) // ran before; result lost
+	enqueue(t, f, agentlink.Request{Key: "k-peek", Type: "terminal.peek", ItemID: "gt-1", ExpiresAt: f.now.Add(time.Hour)})
+	app := &countingApplier{fn: func(r agentlink.Request) agentlink.Result {
+		return agentlink.Result{Key: r.Key, OK: true, Data: json.RawMessage(`{"lines":"fresh"}`)}
+	}}
+	stop := run(t, f.config(app, &logBuf{}))
+	eventually(t, "result", func() bool { return resultFor(t, f, "k-peek") != nil })
+	stop()
+	if app.count() != 1 {
+		t.Fatalf("read-only request not re-run: %d", app.count())
+	}
+	if r := resultFor(t, f, "k-peek"); string(r.Data) != `{"lines":"fresh"}` {
+		t.Fatalf("result = %+v", r)
 	}
 }

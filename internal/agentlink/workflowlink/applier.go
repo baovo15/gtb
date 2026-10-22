@@ -91,7 +91,8 @@ func invalid(msg string) agentlink.Result {
 }
 
 func failed(code string, err error) agentlink.Result {
-	return agentlink.Result{OK: false, Error: code, Data: mustJSON(map[string]string{"message": capString(err.Error(), 1000)})}
+	// Error text can quote git output; strip credentials from URLs (R34).
+	return agentlink.Result{OK: false, Error: code, Data: mustJSON(map[string]string{"message": capString(RedactText(err.Error()), 1000)})}
 }
 
 // findItem locates itemID in the town's gated rigs. The item ID is validated

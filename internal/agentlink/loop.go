@@ -72,7 +72,9 @@ type LoopConfig struct {
 //
 // A 409 resync from POST /events sends a snapshot and carries on. Network
 // errors and 5xx answers end the session; Run reconnects after an
-// exponential backoff (BackoffMin doubling to BackoffMax, with jitter).
+// exponential backoff (BackoffMin doubling to BackoffMax, with jitter). The
+// backoff resets only after a full productive round (snapshot if needed,
+// flush, poll), not merely after hello.
 // Nothing queued is dropped: events stay in the outbox until acked.
 //
 // Snapshot cursor: a snapshot is the machine's whole state, so it supersedes
@@ -83,12 +85,15 @@ type LoopConfig struct {
 // resyncs again, so at worst an evidence event is sent twice.
 //
 // Requests: every request delivered gets a Result posted (R33), including
-// ones that are dropped. A request whose ExpiresAt is not after Now answers
-// {ok:false, error:"expired"} without calling Apply. A key found in the
-// applied set (<townRoot>/.runtime/agentlink/applied.jsonl, last 10k keys)
-// gets its stored result re-posted without calling Apply. Every applied
-// result is stored before it is posted. A successful "snapshot" request
-// makes the loop resync.
+// ones that are dropped. A mutating request (approve, request_changes,
+// item.create, item.sling, item.cancel) whose key is in the applied set
+// (<townRoot>/.runtime/agentlink/applied.jsonl, last 10k keys) gets its
+// stored result re-posted without calling Apply, even after ExpiresAt.
+// Otherwise a request whose ExpiresAt is not after Now answers
+// {ok:false, error:"expired"} without calling Apply. Every result is stored
+// before it is posted: in full for mutating requests, as {ok, error} only for
+// read-only ones, which are re-run if re-delivered. A successful "snapshot"
+// request makes the loop resync.
 func Run(ctx context.Context, cfg LoopConfig) error {
 	if cfg.TownRoot == "" || cfg.ServerURL == "" || cfg.MachineID == "" || cfg.Token == "" || cfg.Collect == nil || cfg.Apply == nil {
 		return errors.New("agentlink: Run: TownRoot, ServerURL, MachineID, Token, Collect and Apply are required")
@@ -99,7 +104,7 @@ func Run(ctx context.Context, cfg LoopConfig) error {
 	}
 	backoff := l.cfg.BackoffMin
 	for {
-		progressed, err := l.session(ctx)
+		productive, err := l.session(ctx)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -107,7 +112,7 @@ func Run(ctx context.Context, cfg LoopConfig) error {
 			l.logf("agentlink: token rejected; run gtb join again")
 			return ErrTokenRejected
 		}
-		if progressed {
+		if productive {
 			backoff = l.cfg.BackoffMin
 		}
 		wait := backoff
@@ -177,9 +182,13 @@ func newLoop(cfg LoopConfig) (*loop, error) {
 
 func (l *loop) logf(format string, args ...any) { l.cfg.Logf(format, args...) }
 
-// session runs one connection until an error. progressed reports whether
-// hello succeeded (so the caller resets its backoff).
-func (l *loop) session(ctx context.Context) (progressed bool, err error) {
+// session runs one connection until an error. productive reports whether at
+// least one full round succeeded: the snapshot when one was needed, the
+// flush, and a requests poll. Only then does the caller reset its backoff
+// (R35b), so a session that says hello but keeps failing (Collect, snapshot
+// or events) backs off like any other failure instead of retrying, and
+// re-collecting, every second.
+func (l *loop) session(ctx context.Context) (productive bool, err error) {
 	host, _ := os.Hostname()
 	resync, err := l.c.hello(ctx, Hello{
 		MachineID: l.cfg.MachineID, Hostname: host, OS: runtime.GOOS, Arch: runtime.GOARCH,
@@ -193,11 +202,11 @@ func (l *loop) session(ctx context.Context) (progressed bool, err error) {
 	for {
 		if l.resync {
 			if err := l.sendSnapshot(ctx); err != nil {
-				return true, err
+				return productive, err
 			}
 		}
 		if err := l.flush(ctx); err != nil {
-			return true, err
+			return productive, err
 		}
 		if l.resync {
 			continue // a 409 during flush: snapshot, then flush again
@@ -209,11 +218,11 @@ func (l *loop) session(ctx context.Context) (progressed bool, err error) {
 				}
 			}
 			if err := l.c.heartbeat(ctx); err != nil {
-				return true, err
+				return productive, err
 			}
 			l.lastHeartbeat = time.Now()
 			if err := l.flush(ctx); err != nil { // events the scan queued
-				return true, err
+				return productive, err
 			}
 			if l.resync {
 				continue
@@ -221,10 +230,11 @@ func (l *loop) session(ctx context.Context) (progressed bool, err error) {
 		}
 		reqs, err := l.c.requests(ctx, l.cfg.PollWait)
 		if err != nil {
-			return true, err
+			return productive, err
 		}
+		productive = true
 		if err := l.handle(ctx, reqs); err != nil {
-			return true, err
+			return productive, err
 		}
 	}
 }
@@ -391,15 +401,27 @@ func (l *loop) handle(ctx context.Context, reqs []Request) error {
 	return nil
 }
 
+// mutatingTypes are the request types whose full result is kept in the
+// applied set and re-posted on re-delivery instead of re-running them.
+var mutatingTypes = map[string]bool{
+	"approve": true, "request_changes": true, "item.create": true, "item.sling": true, "item.cancel": true,
+}
+
+// apply answers one request (see Run). The applied-set lookup comes before
+// the expiry check (R35a): a mutating request that ran but whose result was
+// lost is re-delivered until it has one, possibly after ExpiresAt, and must
+// get the result of the run, not "expired". Read-only requests (snapshot,
+// inspect, terminal.peek) keep only {ok, error} in the set and are re-run
+// when re-delivered before expiry (R35c); re-running them is harmless.
 func (l *loop) apply(ctx context.Context, r Request) Result {
-	if !r.ExpiresAt.After(l.cfg.Now()) {
-		l.logf("agentlink: request %s (%s) expired; dropped", r.Key, r.Type)
-		return Fail(r.Key, ErrCodeExpired)
-	}
-	if res, ok := l.applied.Get(r.Key); ok {
+	if res, ok := l.applied.Get(r.Key); ok && mutatingTypes[r.Type] {
 		l.logf("agentlink: request %s already applied; re-posting its result", r.Key)
 		res.Key = r.Key
 		return res
+	}
+	if !r.ExpiresAt.After(l.cfg.Now()) {
+		l.logf("agentlink: request %s (%s) expired; dropped", r.Key, r.Type)
+		return Fail(r.Key, ErrCodeExpired)
 	}
 	res := l.safeApply(ctx, r)
 	res.Key = r.Key
@@ -407,7 +429,11 @@ func (l *loop) apply(ctx context.Context, r Request) Result {
 		l.logf("agentlink: result of request %s (%s) is too large to post", r.Key, r.Type)
 		res = Fail(r.Key, ErrCodeTooLarge)
 	}
-	if err := l.applied.Put(res); err != nil {
+	stored := res
+	if !mutatingTypes[r.Type] {
+		stored = Result{Key: res.Key, OK: res.OK, Error: res.Error}
+	}
+	if err := l.applied.Put(stored); err != nil {
 		l.logf("agentlink: record applied request %s: %v", r.Key, err)
 	}
 	if r.Type == "snapshot" && res.OK {
