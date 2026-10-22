@@ -540,7 +540,7 @@ func runMQPostMerge(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("post-merge proof: %w", err)
 	}
 
-	result, branchCleanup, err := runVerifiedMQPostMerge(mgr, r.Path, rigGit, mrID, mqPostMergeSkipBranchDelete)
+	result, branchCleanup, err := runVerifiedMQPostMerge(mgr, rigName, r.Path, rigGit, mrID, mqPostMergeSkipBranchDelete)
 	if err != nil {
 		return fmt.Errorf("post-merge cleanup: %w", err)
 	}
@@ -580,13 +580,28 @@ func runMQPostMerge(_ *cobra.Command, args []string) error {
 	return nil
 }
 
-func runVerifiedMQPostMerge(mgr mqPostMergeManager, rigPath string, rigGit mqPostMergeGit, mrID string, skipBranchDelete bool) (*refinery.PostMergeResult, mqPostMergeBranchCleanup, error) {
+// mqPostMergeGate is the gated-workflow guard of gt mq post-merge (see
+// mqPostMergeGatedCheck). Tests replace it.
+var mqPostMergeGate = mqPostMergeGatedCheck
+
+func runVerifiedMQPostMerge(mgr mqPostMergeManager, rigName, rigPath string, rigGit mqPostMergeGit, mrID string, skipBranchDelete bool) (*refinery.PostMergeResult, mqPostMergeBranchCleanup, error) {
 	mr, err := mgr.FindMRForPostMerge(mrID)
+	if err != nil {
+		return nil, mqPostMergeBranchCleanup{}, err
+	}
+	// Gated workflow items close only after the refinery merge gate passed
+	// for the head being closed (R27).
+	recordDone, err := mqPostMergeGate(rigName, rigPath, mr)
 	if err != nil {
 		return nil, mqPostMergeBranchCleanup{}, err
 	}
 	if err := verifyMQPostMergeProof(rigGit, mr); err != nil {
 		return nil, mqPostMergeBranchCleanup{}, err
+	}
+	if recordDone != nil {
+		if err := recordDone(); err != nil {
+			return nil, mqPostMergeBranchCleanup{}, err
+		}
 	}
 
 	result, err := mgr.PostMergeMR(mr)

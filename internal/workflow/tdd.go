@@ -316,9 +316,9 @@ func lastBytes(s string, n int) string {
 	return s[start:]
 }
 
-// firstBytes returns the longest prefix of s of at most n bytes that ends
+// FirstBytes returns the longest prefix of s of at most n bytes that ends
 // on a rune boundary.
-func firstBytes(s string, n int) string {
+func FirstBytes(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}

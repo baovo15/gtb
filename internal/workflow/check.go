@@ -58,6 +58,6 @@ func Check(env GateEnv, r Runner, itemID, dir string) (CheckRun, error) {
 // splitting a rune. It keeps as much of the start of cmd as fits (the
 // newline included), then fills the remaining budget with the end of out.
 func capTail(cmd, out string) string {
-	prefix := firstBytes(cmd+"\n", tailBytes)
+	prefix := FirstBytes(cmd+"\n", tailBytes)
 	return prefix + lastBytes(out, tailBytes-len(prefix))
 }

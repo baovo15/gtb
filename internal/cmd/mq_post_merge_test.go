@@ -90,7 +90,7 @@ func TestRunVerifiedMQPostMerge_ProofFailurePreservesRecordsAndBranch(t *testing
 	mgr := &fakeMQPostMergeManager{mr: testMQPostMergeMR()}
 	rigGit := &fakeMQPostMergeGit{verifyErr: errors.New("not reachable")}
 
-	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, false)
+	_, _, err := runVerifiedMQPostMerge(mgr, "test-rig", t.TempDir(), rigGit, mgr.mr.ID, false)
 	if err == nil || !strings.Contains(err.Error(), "merge proof failed") {
 		t.Fatalf("runVerifiedMQPostMerge error = %v, want merge proof failure", err)
 	}
@@ -112,7 +112,7 @@ func TestRunVerifiedMQPostMerge_VerifiedHeadClosesAndLeaseDeletes(t *testing.T) 
 	mgr := &fakeMQPostMergeManager{mr: testMQPostMergeMR()}
 	rigGit := &fakeMQPostMergeGit{remoteTip: mgr.mr.CommitSHA, localHead: mgr.mr.CommitSHA}
 
-	_, cleanup, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, false)
+	_, cleanup, err := runVerifiedMQPostMerge(mgr, "test-rig", t.TempDir(), rigGit, mgr.mr.ID, false)
 	if err != nil {
 		t.Fatalf("runVerifiedMQPostMerge: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestRunVerifiedMQPostMerge_SkipBranchDeleteStillRequiresProof(t *testing.T)
 	mgr := &fakeMQPostMergeManager{mr: testMQPostMergeMR()}
 	rigGit := &fakeMQPostMergeGit{}
 
-	_, cleanup, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, true)
+	_, cleanup, err := runVerifiedMQPostMerge(mgr, "test-rig", t.TempDir(), rigGit, mgr.mr.ID, true)
 	if err != nil {
 		t.Fatalf("runVerifiedMQPostMerge: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestRunVerifiedMQPostMerge_OpenPRSkipsRemoteDeleteAfterProof(t *testing.T) 
 	mgr := &fakeMQPostMergeManager{mr: testMQPostMergeMR()}
 	rigGit := &fakeMQPostMergeGit{openPR: true, localHead: mgr.mr.CommitSHA}
 
-	_, cleanup, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, false)
+	_, cleanup, err := runVerifiedMQPostMerge(mgr, "test-rig", t.TempDir(), rigGit, mgr.mr.ID, false)
 	if err != nil {
 		t.Fatalf("runVerifiedMQPostMerge: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestRunVerifiedMQPostMerge_LeaseDeleteFailureReturnsAfterPostMerge(t *testi
 	mgr := &fakeMQPostMergeManager{mr: testMQPostMergeMR()}
 	rigGit := &fakeMQPostMergeGit{remoteTip: mgr.mr.CommitSHA, deleteErr: errors.New("stale info")}
 
-	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, false)
+	_, _, err := runVerifiedMQPostMerge(mgr, "test-rig", t.TempDir(), rigGit, mgr.mr.ID, false)
 	if err == nil || !strings.Contains(err.Error(), "remote branch delete") {
 		t.Fatalf("runVerifiedMQPostMerge error = %v, want remote branch delete failure", err)
 	}
@@ -206,7 +206,7 @@ func TestRunVerifiedMQPostMerge_MissingRemoteBranchIsIdempotentAfterProof(t *tes
 	mgr := &fakeMQPostMergeManager{mr: testMQPostMergeMR()}
 	rigGit := &fakeMQPostMergeGit{localHead: mgr.mr.CommitSHA}
 
-	_, cleanup, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, false)
+	_, cleanup, err := runVerifiedMQPostMerge(mgr, "test-rig", t.TempDir(), rigGit, mgr.mr.ID, false)
 	if err != nil {
 		t.Fatalf("runVerifiedMQPostMerge: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestRunVerifiedMQPostMerge_MissingSubmittedHeadFailsClosed(t *testing.T) {
 	mgr := &fakeMQPostMergeManager{mr: mr}
 	rigGit := &fakeMQPostMergeGit{}
 
-	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, false)
+	_, _, err := runVerifiedMQPostMerge(mgr, "test-rig", t.TempDir(), rigGit, mgr.mr.ID, false)
 	if err == nil || !strings.Contains(err.Error(), "missing submitted commit_sha") {
 		t.Fatalf("runVerifiedMQPostMerge error = %v, want missing submitted head", err)
 	}
@@ -246,7 +246,7 @@ func TestRunVerifiedMQPostMerge_SourceTargetBranchFailsClosed(t *testing.T) {
 	mgr := &fakeMQPostMergeManager{mr: mr}
 	rigGit := &fakeMQPostMergeGit{}
 
-	_, _, err := runVerifiedMQPostMerge(mgr, t.TempDir(), rigGit, mgr.mr.ID, false)
+	_, _, err := runVerifiedMQPostMerge(mgr, "test-rig", t.TempDir(), rigGit, mgr.mr.ID, false)
 	if err == nil || !strings.Contains(err.Error(), "matches target branch") {
 		t.Fatalf("runVerifiedMQPostMerge error = %v, want source/target failure", err)
 	}

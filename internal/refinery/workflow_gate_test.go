@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -561,5 +562,144 @@ func TestProcessBatch_GatedMRUsesGate(t *testing.T) {
 	}
 	if err := gitpkg.NewGit(f.workDir).VerifyPushedCommitReachableFromPushTarget("origin", "main", f.mr.CommitSHA); err == nil {
 		t.Fatal("gated MR merged while CI pending")
+	}
+}
+
+// failCheckStore makes AddCheck fail.
+type failCheckStore struct{ workflow.Store }
+
+func (failCheckStore) AddCheck(workflow.CheckRun) error { return errors.New("dolt: write failed") }
+
+func (f *gatedFixture) mergeViaFakePR() {
+	f.provider.pending, f.provider.passed = false, true
+	f.provider.mergeFunc = func() (string, error) {
+		run(f.t, f.workDir, "git", "checkout", "main")
+		run(f.t, f.workDir, "git", "merge", "--no-ff", "-m", "merge PR", f.branch)
+		run(f.t, f.workDir, "git", "push", "origin", "main")
+		return run(f.t, f.workDir, "git", "rev-parse", "main"), nil
+	}
+}
+
+func TestProcessBatch_GatedSuccessClosesBeads(t *testing.T) {
+	f := newGatedFixture(t)
+	f.mergeViaFakePR()
+	submitted := f.mr.CommitSHA
+
+	res := f.e.ProcessBatch(context.Background(), []*MRInfo{f.mr}, "main", DefaultBatchConfig())
+	if res.Error != nil || len(res.Merged) != 1 {
+		t.Fatalf("batch result = %+v (err %v), want one merged", res, res.Error)
+	}
+	if f.mr.CommitSHA == submitted {
+		t.Fatal("caller's MR did not adopt the bump head")
+	}
+	if f.step() != workflow.StepDone {
+		t.Fatalf("step = %s, want done", f.step())
+	}
+	if got := f.store.issues["gt-mr"].Status; got != beadsdk.StatusClosed {
+		t.Fatalf("MR bead status = %s, want closed", got)
+	}
+	if reason := f.store.closeReasons["gt-mr"]; reason != string(CloseReasonMerged) {
+		t.Fatalf("MR close reason = %q, want merged", reason)
+	}
+	if got := f.store.issues[f.item.ID].Status; got != beadsdk.StatusClosed {
+		t.Fatalf("item bead status = %s, want closed", got)
+	}
+}
+
+func TestWorkflowPreMerge_MalformedSettingsPausesMerges(t *testing.T) {
+	workDir, _, _ := testGitRepo(t)
+	createFeatureBranch(t, workDir, "feature", "a.txt", "a\n")
+	head := run(t, workDir, "git", "rev-parse", "feature")
+	store := newPrepushStore(prepushIssue("gt-src", ""), prepushMRIssue("gt-mr", "feature", "main", "gt-src", head))
+	e := newPrepushEngineer(t, workDir, store)
+	rigDir := t.TempDir()
+	e.rig.Path = rigDir
+	if err := os.MkdirAll(filepath.Join(rigDir, "settings"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, rigDir, "settings/config.json", `{"workflow": {`)
+
+	mr := &MRInfo{ID: "gt-mr", Branch: "feature", Target: "main", SourceIssue: "gt-src", CommitSHA: head}
+	ok, reason := e.workflowPreMerge(context.Background(), mr)
+	if ok {
+		t.Fatal("malformed settings passed through")
+	}
+	if !strings.Contains(reason, "merges paused until settings parse") || !strings.Contains(reason, filepath.Join(rigDir, "settings", "config.json")) {
+		t.Fatalf("reason = %q, want settings path and pause message", reason)
+	}
+	if err := e.LoadConfig(); err == nil || !strings.Contains(err.Error(), "merges paused until settings parse") {
+		t.Fatalf("LoadConfig err = %v, want pause message", err)
+	}
+	if store.issues["gt-mr"].Status != beadsdk.StatusOpen {
+		t.Fatal("MR closed on settings error")
+	}
+}
+
+func TestWorkflowPreMerge_CIFailedEvidenceWriteFailsRefuses(t *testing.T) {
+	f := newGatedFixture(t)
+	f.provider.pending = false
+	f.provider.checksErr = &ChecksFailedError{Names: []string{"test"}}
+	f.env.Store = failCheckStore{f.env.Store}
+
+	res := f.e.workflowGate(context.Background(), f.mr)
+	if res.OK || res.Rejected || res.Result.NoMerge || !strings.Contains(res.Reason, "recording CI failure") {
+		t.Fatalf("result = %+v, want refusal (retry)", res)
+	}
+	if f.step() != "merge" || len(f.transitions()) != 1 {
+		t.Fatalf("step %s transitions %+v, want unchanged", f.step(), f.transitions())
+	}
+	if f.store.issues["gt-mr"].Status != beadsdk.StatusOpen {
+		t.Fatal("MR closed without CI evidence")
+	}
+}
+
+func TestWorkflowPreMerge_ReadyRecordsCIPassForHead(t *testing.T) {
+	f := newGatedFixture(t)
+	f.provider.pending, f.provider.passed = false, true
+	d := f.e.gateDecision(context.Background(), f.mr)
+	if d.Result != GateReady || !d.Gated || d.HeadSHA != f.mr.CommitSHA || d.Version != "0.25.0" {
+		t.Fatalf("decision = %+v", d)
+	}
+	checks, _ := f.env.Store.Checks(f.item.ID)
+	if len(checks) != 1 || !checks[0].Passed || checks[0].CmdSetSHA != "ci" || checks[0].Tail != "head "+d.HeadSHA || checks[0].Source != "gtb" || checks[0].Provenance != "verified" {
+		t.Fatalf("checks = %+v", checks)
+	}
+	if f.provider.mergeCalled || f.step() != "merge" {
+		t.Fatal("gate decision merged or moved the item")
+	}
+}
+
+func TestWorkflowPreMerge_VersionMovedRefusesSecondBump(t *testing.T) {
+	f := newGatedFixture(t)
+	if ok, _ := f.e.workflowPreMerge(context.Background(), f.mr); ok {
+		t.Fatal("pending run returned ok")
+	}
+	count := f.remoteCount()
+	// Someone else lands a minor bump on main: target is now 0.25.0, which
+	// the branch's bump commit already claims.
+	run(t, f.workDir, "git", "checkout", "main")
+	writeFile(t, f.workDir, "package.json", "{\n  \"name\": \"tbb\",\n  \"version\": \"0.25.0\"\n}\n")
+	writeFile(t, f.workDir, ".claude-plugin/plugin.json", "{\"name\":\"tbb\",\"version\":\"0.25.0\"}\n")
+	run(t, f.workDir, "git", "commit", "-am", "chore: bump version to 0.25.0")
+	run(t, f.workDir, "git", "push", "origin", "main")
+
+	mr2 := *f.mr
+	ok, reason := f.e.workflowPreMerge(context.Background(), &mr2)
+	if ok || !strings.Contains(reason, "rebase onto main (version moved)") {
+		t.Fatalf("ok=%v reason=%q, want version moved", ok, reason)
+	}
+	if got := f.remoteCount(); got != count {
+		t.Fatalf("commit count %s -> %s, want no second bump", count, got)
+	}
+}
+
+func TestWorkflowPreMerge_CITailRuneSafe(t *testing.T) {
+	f := newGatedFixture(t)
+	f.provider.pending = false
+	f.provider.checksErr = &ChecksFailedError{Names: []string{strings.Repeat("a", 999) + "é"}}
+	f.e.workflowGate(context.Background(), f.mr)
+	checks, _ := f.env.Store.Checks(f.item.ID)
+	if len(checks) != 1 || !utf8.ValidString(checks[0].Tail) || len(checks[0].Tail) > 1000 {
+		t.Fatalf("tail = %q (len %d)", checks[0].Tail, len(checks[0].Tail))
 	}
 }

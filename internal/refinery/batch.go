@@ -359,7 +359,11 @@ func (e *Engineer) processSingleMR(ctx context.Context, mr *MRInfo, target strin
 	mergeMR := *mr
 	mergeMR.Target = target
 	processResult := e.doMerge(ctx, &mergeMR)
-	if strings.TrimSpace(mr.CommitSHA) == "" {
+	// doMerge may resolve the submitted head or, for gated items, adopt the
+	// pushed version-bump commit as the MR head (adoptHead also rewrites the
+	// MR bead's commit_sha). Post-merge cleanup must see that same head or its
+	// close snapshot and merge proof reject the MR.
+	if mergeMR.CommitSHA != mr.CommitSHA {
 		mr.CommitSHA = mergeMR.CommitSHA
 	}
 	if processResult.Success {

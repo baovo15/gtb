@@ -325,9 +325,9 @@ func (e *Engineer) LoadConfig() error {
 	if err := e.loadMergeQueueConfig(); err != nil {
 		return err
 	}
-	gated, err := workflow.LoadConfig(e.rig.Path)
+	gated, err := loadGatedConfig(e.rig)
 	if err != nil {
-		return fmt.Errorf("loading gated workflow config: %w", err)
+		return err
 	}
 	if !gated.Enabled {
 		return nil
