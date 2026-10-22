@@ -35,13 +35,13 @@
               "-X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1"
             ];
 
-            subPackages = [ "cmd/gt" ];
+            subPackages = [ "cmd/gtb" ];
 
             meta = with pkgs.lib; {
               description = "Multi-agent orchestration system for Claude Code with persistent work tracking";
               homepage = "https://github.com/gastownhall/gastown";
               license = licenses.mit;
-              mainProgram = "gt";
+              mainProgram = "gtb";
             };
           };
           default = self.packages.${system}.gt;

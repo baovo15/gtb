@@ -47,7 +47,8 @@ USER agent
 
 COPY --chown=agent:agent . /app/gastown
 
-RUN cd /app/gastown && make build
+# make build produces gtb; keep a gt symlink for scripts that still call gt.
+RUN cd /app/gastown && make build && ln -sfn gtb gt
 
 COPY --chown=agent:agent docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh

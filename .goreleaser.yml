@@ -1,4 +1,4 @@
-# GoReleaser configuration for Gas Town (gt)
+# GoReleaser configuration for gtb
 # See https://goreleaser.com for documentation
 
 version: 2
@@ -9,115 +9,36 @@ before:
     - go mod tidy
 
 builds:
-  - id: gt-linux-amd64
-    main: ./cmd/gt
-    binary: gt
+  - id: gtb
+    main: ./cmd/gtb
+    binary: gtb
     env:
       - CGO_ENABLED=1
     goos:
       - linux
-    goarch:
-      - amd64
-    ldflags:
-      - -s -w
-      - -X github.com/steveyegge/gastown/internal/cmd.Version={{.Version}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Build={{.ShortCommit}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Commit={{.Commit}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Branch={{.Branch}}
-
-  - id: gt-linux-arm64
-    main: ./cmd/gt
-    binary: gt
-    env:
-      - CGO_ENABLED=1
-      - CC=aarch64-linux-gnu-gcc
-      - CXX=aarch64-linux-gnu-g++
-    goos:
-      - linux
-    goarch:
-      - arm64
-    ldflags:
-      - -s -w
-      - -X github.com/steveyegge/gastown/internal/cmd.Version={{.Version}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Build={{.ShortCommit}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Commit={{.Commit}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Branch={{.Branch}}
-
-  - id: gt-darwin-amd64
-    main: ./cmd/gt
-    binary: gt
-    env:
-      - CGO_ENABLED=1
-    goos:
       - darwin
     goarch:
       - amd64
-    ldflags:
-      - -s -w
-      - -X github.com/steveyegge/gastown/internal/cmd.Version={{.Version}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Build={{.ShortCommit}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Commit={{.Commit}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Branch={{.Branch}}
-
-  - id: gt-darwin-arm64
-    main: ./cmd/gt
-    binary: gt
-    env:
-      - CGO_ENABLED=1
-    goos:
-      - darwin
-    goarch:
       - arm64
+    overrides:
+      # linux/arm64 cross-compiles CGO with the aarch64 toolchain.
+      - goos: linux
+        goarch: arm64
+        env:
+          - CGO_ENABLED=1
+          - CC=aarch64-linux-gnu-gcc
+          - CXX=aarch64-linux-gnu-g++
     ldflags:
       - -s -w
       - -X github.com/steveyegge/gastown/internal/cmd.Version={{.Version}}
       - -X github.com/steveyegge/gastown/internal/cmd.Build={{.ShortCommit}}
       - -X github.com/steveyegge/gastown/internal/cmd.Commit={{.Commit}}
       - -X github.com/steveyegge/gastown/internal/cmd.Branch={{.Branch}}
-
-  - id: gt-windows-amd64
-    main: ./cmd/gt
-    binary: gt
-    env:
-      - CGO_ENABLED=1
-      - CC=x86_64-w64-mingw32-gcc
-      - CXX=x86_64-w64-mingw32-g++
-    goos:
-      - windows
-    goarch:
-      - amd64
-    ldflags:
-      - -s -w
-      - -X github.com/steveyegge/gastown/internal/cmd.Version={{.Version}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Build={{.ShortCommit}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Commit={{.Commit}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Branch={{.Branch}}
-      - -buildmode=exe
-
-  - id: gt-freebsd-amd64
-    main: ./cmd/gt
-    binary: gt
-    env:
-      - CGO_ENABLED=0
-    goos:
-      - freebsd
-    goarch:
-      - amd64
-    ldflags:
-      - -s -w
-      - -X github.com/steveyegge/gastown/internal/cmd.Version={{.Version}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Build={{.ShortCommit}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Commit={{.Commit}}
-      - -X github.com/steveyegge/gastown/internal/cmd.Branch={{.Branch}}
-
 
 archives:
-  - id: gt-archive
+  - id: gtb-archive
     formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
-    format_overrides:
-      - goos: windows
-        formats: [zip]
     files:
       - LICENSE
       - README.md
@@ -159,7 +80,7 @@ release:
   header: |
     ## Gas Town v{{.Version}}
 
-    Pre-compiled binaries for Linux, macOS (Intel & Apple Silicon), and Windows.
+    Pre-compiled `gtb` binaries for Linux and macOS (amd64 & arm64).
 
     ### Installation
 

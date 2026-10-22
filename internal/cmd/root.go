@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/session"
@@ -23,16 +22,28 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:               "gt", // Updated in init() based on GT_COMMAND
+	Use:               defaultRootCommandName, // Updated in init() based on GT_COMMAND
 	Short:             "Gas Town - Multi-agent workspace manager",
 	Version:           Version,
 	Long:              "", // Updated in init() based on GT_COMMAND
 	PersistentPreRunE: persistentPreRun,
 }
 
+// defaultRootCommandName is the root command name when GT_COMMAND is unset.
+const defaultRootCommandName = "gtb"
+
 func init() {
-	// Update command name based on GT_COMMAND env var
-	cmdName := cli.Name()
+	applyRootCommandName()
+}
+
+// applyRootCommandName sets the root command name from the GT_COMMAND env
+// var, defaulting to "gtb". It reads the env directly rather than cli.Name(),
+// whose cached default is still "gt".
+func applyRootCommandName() {
+	cmdName := os.Getenv("GT_COMMAND")
+	if cmdName == "" {
+		cmdName = defaultRootCommandName
+	}
 	rootCmd.Use = cmdName
 	rootCmd.Long = fmt.Sprintf(`Gas Town (%s) manages multi-agent workspaces called rigs.
 

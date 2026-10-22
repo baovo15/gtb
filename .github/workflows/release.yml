@@ -34,7 +34,7 @@ jobs:
       - name: Install cross-compilation toolchains
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Reject replace directives in go.mod
         run: |
@@ -204,11 +204,11 @@ jobs:
             depends_on "tmux"
 
             def install
-              bin.install "gt"
+              bin.install "gtb"
             end
 
             test do
-              assert_match version.to_s, shell_output("#{bin}/gt version")
+              assert_match version.to_s, shell_output("#{bin}/gtb version")
             end
           end
           FORMULA
