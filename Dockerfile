@@ -23,8 +23,11 @@ RUN apt-get update && apt-get install -y \
     vim \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Install Go from official tarball (apt golang-go is too old)
+# Install Go from official tarball (apt golang-go is too old). The base image
+# may already ship a different Go in /usr/local/go; extracting over it mixes
+# the two standard libraries, so remove it first.
 RUN ARCH=$(dpkg --print-architecture) && \
+    rm -rf /usr/local/go && \
     curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" | tar -C /usr/local -xz
 ENV PATH="/app/gastown:/usr/local/go/bin:/home/agent/go/bin:${PATH}"
 
