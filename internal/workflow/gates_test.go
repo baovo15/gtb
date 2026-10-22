@@ -181,6 +181,13 @@ func TestGate_ArtifactApproval(t *testing.T) {
 			addApproval(t, env, it.ID, "spec", "approve", "human", now)
 			addApproval(t, env, it.ID, "spec", "reject", "human", now)
 		}},
+		{name: "request_changes on older sha then revised", kind: KindTask, step: "spec", waiting: "approve spec", reasonSub: "changes requested on spec", setup: func(t *testing.T, env GateEnv, it *Item) {
+			writeArtifact(t, env, it.ID, "spec", "v1\n")
+			now := time.Now()
+			addApproval(t, env, it.ID, "spec", "approve", "human", now)
+			addApproval(t, env, it.ID, "spec", "request_changes", "human", now.Add(time.Second))
+			writeArtifact(t, env, it.ID, "spec", "v2\n")
+		}},
 		{name: "approve after request_changes passes", kind: KindTask, step: "spec", passed: true, setup: func(t *testing.T, env GateEnv, it *Item) {
 			writeArtifact(t, env, it.ID, "spec", "body\n")
 			now := time.Now()

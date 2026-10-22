@@ -149,7 +149,8 @@ func (g *gateCtx) artifact(name string) (content []byte, sha string, fm map[stri
 
 // approved checks the human approval of artifact name at sha. The latest
 // human decision (by At, the last appended winning ties) decides: an approve
-// must match sha; a request_changes or reject on sha blocks.
+// must match sha; a newer request_changes or reject blocks, and also waits
+// for a human when the artifact has been revised since that request.
 func (g *gateCtx) approved(name, sha string, approvals []Approval) {
 	var decisions []Approval
 	for _, a := range approvals {
@@ -167,8 +168,12 @@ func (g *gateCtx) approved(name, sha string, approvals []Approval) {
 		if last.Verdict == verdictApprove && last.SHA == sha {
 			return
 		}
-		if last.Verdict != verdictApprove && last.SHA == sha {
+		if last.Verdict != verdictApprove {
 			g.fail("changes requested on %s", name)
+			if last.SHA != sha {
+				// Revised since the request: a human must look again.
+				g.wait("approve " + name)
+			}
 			return
 		}
 	}
