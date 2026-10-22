@@ -34,6 +34,24 @@ const defaultRootCommandName = "gtb"
 
 func init() {
 	applyRootCommandName()
+	applyUpstreamFeatureVisibility()
+}
+
+// upstreamFeaturesEnabled reports whether upstream Gas Town features that gtb
+// does not use (wasteland/DoltHub federation, the mTLS polecat proxy) should
+// be surfaced. Only GTB_UPSTREAM_FEATURES=1 enables them (spec §9).
+func upstreamFeaturesEnabled() bool {
+	return os.Getenv("GTB_UPSTREAM_FEATURES") == "1"
+}
+
+// applyUpstreamFeatureVisibility hides upstream-only commands from help unless
+// upstreamFeaturesEnabled. The commands stay registered and runnable; only
+// their visibility changes. proxy-subcmds is internal plumbing for
+// gt-proxy-server and was already hidden upstream, so it stays hidden either
+// way.
+func applyUpstreamFeatureVisibility() {
+	wlCmd.Hidden = !upstreamFeaturesEnabled()
+	proxySubcmdsCmd.Hidden = true
 }
 
 // applyRootCommandName sets the root command name from the GT_COMMAND env

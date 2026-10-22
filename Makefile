@@ -35,8 +35,8 @@ ifeq ($(shell uname),Darwin)
 endif
 
 build:
-	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/gt-proxy-server ./cmd/gt-proxy-server
-	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/gt-proxy-client ./cmd/gt-proxy-client
+	@# cmd/gt-proxy-server and cmd/gt-proxy-client are upstream-only (spec §9):
+	@# kept in the tree but not built. Build them with: go build ./cmd/gt-proxy-...
 	go build -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/gtb
 
 desktop-build:
