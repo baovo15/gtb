@@ -58,6 +58,21 @@ func currentArtifactSHA(env GateEnv, itemID, artifact string) (string, error) {
 	return sha, err
 }
 
+// RequireHuman is the human guard shared by every human-only action. It
+// returns ErrNotHuman (wrapped) when any AgentMarkerEnv variable is non-empty
+// or t is not a TTY, checked in that order.
+func RequireHuman(t Terminal, getenv func(string) string) error {
+	for _, k := range AgentMarkerEnv {
+		if getenv(k) != "" {
+			return fmt.Errorf("%w (%s is set)", ErrNotHuman, k)
+		}
+	}
+	if t == nil || !t.IsTTY() {
+		return fmt.Errorf("%w (not a TTY)", ErrNotHuman)
+	}
+	return nil
+}
+
 // HumanApprove records a human verdict (approve, request_changes or reject)
 // on the current content of artifact. It refuses with ErrNotHuman when any
 // AgentMarkerEnv variable is non-empty or t is not a TTY (checked in that
@@ -68,13 +83,8 @@ func HumanApprove(env GateEnv, t Terminal, getenv func(string) string, itemID, a
 	if err := validateID(itemID); err != nil {
 		return Approval{}, err
 	}
-	for _, k := range AgentMarkerEnv {
-		if getenv(k) != "" {
-			return Approval{}, fmt.Errorf("%w (%s is set)", ErrNotHuman, k)
-		}
-	}
-	if t == nil || !t.IsTTY() {
-		return Approval{}, fmt.Errorf("%w (not a TTY)", ErrNotHuman)
+	if err := RequireHuman(t, getenv); err != nil {
+		return Approval{}, err
 	}
 	verb, ok := humanVerdictVerb[verdict]
 	if !ok {

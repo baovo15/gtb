@@ -61,6 +61,10 @@ func validateID(id string) error {
 	return nil
 }
 
+// ValidateID reports whether id is a safe item identifier (see validateID).
+// It returns an error wrapping ErrInvalidItemID otherwise.
+func ValidateID(id string) error { return validateID(id) }
+
 // validateIDs validates each id with validateID.
 func validateIDs(ids ...string) error {
 	for _, id := range ids {

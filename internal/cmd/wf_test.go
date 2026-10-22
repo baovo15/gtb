@@ -1,0 +1,503 @@
+package cmd
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/workflow"
+)
+
+// wfTestEnv is the in-memory workflow environment injected through
+// newWorkflowEnv for command tests. Nothing here touches Dolt, bd or git.
+type wfTestEnv struct {
+	env      workflow.GateEnv
+	checkout string
+	gotRig   string
+}
+
+func useMemWorkflowEnv(t *testing.T) *wfTestEnv {
+	t.Helper()
+	town := t.TempDir()
+	w := &wfTestEnv{
+		env: workflow.GateEnv{
+			TownRoot: town,
+			Rig:      "r1",
+			Store:    workflow.NewMemStore(),
+			Items:    workflow.NewMemItems(),
+			Config:   &config.GatedWorkflow{Enabled: true},
+			Now:      func() time.Time { return time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC) },
+		},
+		checkout: t.TempDir(),
+	}
+	oldEnv, oldDir, oldActor := newWorkflowEnv, workflowCheckoutDir, workflowActor
+	newWorkflowEnv = func(_ *cobra.Command, rig string) (workflow.GateEnv, error) {
+		w.gotRig = rig
+		return w.env, nil
+	}
+	workflowCheckoutDir = func(string, string) string { return w.checkout }
+	workflowActor = func() string { return "tester" }
+	t.Cleanup(func() { newWorkflowEnv, workflowCheckoutDir, workflowActor = oldEnv, oldDir, oldActor })
+	return w
+}
+
+// runWF runs args against a fresh root holding the workflow commands and
+// returns stdout, stderr and the exit code main would use.
+func runWF(t *testing.T, args ...string) (string, string, int) {
+	t.Helper()
+	root := &cobra.Command{Use: "gtb", SilenceUsage: true}
+	root.AddGroup(&cobra.Group{ID: GroupWork, Title: "Work Management:"})
+	root.AddCommand(newWorkflowCommands()...)
+	var out, errb bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&errb)
+	root.SetArgs(args)
+	err := root.Execute()
+	code := 0
+	if err != nil {
+		code = 1
+		if c, ok := IsSilentExit(err); ok {
+			code = c
+		}
+	}
+	return out.String(), errb.String(), code
+}
+
+func clearAgentMarkers(t *testing.T) {
+	t.Helper()
+	for _, k := range workflow.AgentMarkerEnv {
+		t.Setenv(k, "")
+	}
+}
+
+func newItemID(t *testing.T, kind, title string) string {
+	t.Helper()
+	out, errOut, code := runWF(t, "item", "new", kind, title, "--json")
+	if code != 0 {
+		t.Fatalf("item new exit %d: %s %s", code, out, errOut)
+	}
+	var v struct{ ID string }
+	if err := json.Unmarshal([]byte(out), &v); err != nil || v.ID == "" {
+		t.Fatalf("item new json %q: %v", out, err)
+	}
+	return v.ID
+}
+
+type conflictStore struct{ workflow.Store }
+
+func (conflictStore) Transition(string, workflow.Step, workflow.Step, string) error {
+	return workflow.ErrStepConflict
+}
+
+func approveArtifact(t *testing.T, w *wfTestEnv, id, name string) {
+	t.Helper()
+	_, sha, _, err := workflow.ReadArtifact(workflow.ArtifactPath(w.env.TownRoot, w.env.Rig, id, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.env.Store.AddApproval(workflow.Approval{
+		ItemID: id, Artifact: name, SHA: sha, Verdict: "approve",
+		Role: "human", Source: "human", Channel: "terminal", Actor: "h", At: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAdvanceCmd_ExitCodes(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	id := newItemID(t, "task", "x")
+
+	out, _, code := runWF(t, "advance", id)
+	if code != 3 {
+		t.Fatalf("refused gate: exit %d, want 3; out=%q", code, out)
+	}
+	if !strings.Contains(out, "- spec.md not approved") {
+		t.Errorf("reasons not printed one per line: %q", out)
+	}
+	if !strings.Contains(out, "waiting for: approve spec") {
+		t.Errorf("waiting line missing: %q", out)
+	}
+
+	approveArtifact(t, w, id, "spec")
+	if out, errOut, code := runWF(t, "advance", id); code != 0 {
+		t.Fatalf("approved gate: exit %d, want 0; %q %q", code, out, errOut)
+	}
+	it, _ := w.env.Items.Get(id)
+	if it.Step != "plan" {
+		t.Fatalf("step = %s, want plan", it.Step)
+	}
+
+	id2 := newItemID(t, "task", "y")
+	approveArtifact(t, w, id2, "spec")
+	w.env.Store = conflictStore{w.env.Store}
+	if out, errOut, code := runWF(t, "advance", id2); code != 4 {
+		t.Fatalf("conflict: exit %d, want 4; %q %q", code, out, errOut)
+	}
+}
+
+func TestAdvanceCmd_JSON(t *testing.T) {
+	useMemWorkflowEnv(t)
+	id := newItemID(t, "task", "x")
+	out, _, code := runWF(t, "advance", id, "--json")
+	if code != 3 {
+		t.Fatalf("exit %d, want 3", code)
+	}
+	var v struct {
+		Moved bool
+		Gate  struct {
+			Passed          bool
+			Reasons         []string
+			WaitingForHuman string `json:"waiting_for_human"`
+		}
+	}
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("not one JSON object: %q: %v", out, err)
+	}
+	if v.Moved || v.Gate.Passed || v.Gate.WaitingForHuman != "approve spec" || len(v.Gate.Reasons) == 0 {
+		t.Errorf("unexpected advance json: %+v", v)
+	}
+}
+
+func TestApproveCmd_RefusedUnderAgentEnv(t *testing.T) {
+	useMemWorkflowEnv(t)
+	id := newItemID(t, "task", "x")
+	t.Setenv("GT_ROLE", "polecat")
+	for _, verb := range []string{"approve", "request-changes"} {
+		_, errOut, code := runWF(t, verb, id, "spec")
+		if code != 1 {
+			t.Errorf("%s: exit %d, want 1", verb, code)
+		}
+		if strings.TrimSpace(errOut) != "approvals must come from a human" {
+			t.Errorf("%s: stderr = %q", verb, errOut)
+		}
+	}
+}
+
+func TestApproveChecks_RefusedUnderAgentEnv(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	w.env.Config.CheckCommands = []string{"go test ./..."}
+	t.Setenv("CLAUDECODE", "1")
+	_, errOut, code := runWF(t, "approve-checks")
+	if code != 1 || strings.TrimSpace(errOut) != "approvals must come from a human" {
+		t.Fatalf("exit %d stderr %q", code, errOut)
+	}
+}
+
+type yesTerminal struct{ prompts []string }
+
+func (y *yesTerminal) IsTTY() bool { return true }
+func (y *yesTerminal) Confirm(p string) (bool, error) {
+	y.prompts = append(y.prompts, p)
+	return true, nil
+}
+
+func TestApproveChecks_WritesSHA(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	clearAgentMarkers(t)
+	cmds := []string{"go test ./...", "go vet ./..."}
+	rigPath := filepath.Join(w.env.TownRoot, w.env.Rig)
+	settings := config.NewRigSettings()
+	settings.Workflow = &config.WorkflowConfig{Gated: &config.GatedWorkflow{Enabled: true, CheckCommands: cmds}}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), settings); err != nil {
+		t.Fatal(err)
+	}
+	w.env.Config.CheckCommands = cmds
+	term := &yesTerminal{}
+	oldTerm := workflowTerminal
+	workflowTerminal = func() workflow.Terminal { return term }
+	t.Cleanup(func() { workflowTerminal = oldTerm })
+
+	out, errOut, code := runWF(t, "approve-checks")
+	if code != 0 {
+		t.Fatalf("exit %d: %q %q", code, out, errOut)
+	}
+	sha := workflow.CheckCommandsSHA(cmds)
+	want := "Approve check commands sha " + sha[:12] + " for rig r1? [y/N]"
+	if len(term.prompts) != 1 || term.prompts[0] != want {
+		t.Errorf("prompts = %q, want %q", term.prompts, want)
+	}
+	got, err := config.LoadRigSettings(config.RigSettingsPath(rigPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Workflow.Gated.CheckCommandsApprovedSHA != sha {
+		t.Errorf("approved sha = %q, want %q", got.Workflow.Gated.CheckCommandsApprovedSHA, sha)
+	}
+}
+
+func TestItemNew_WritesStub(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	id := newItemID(t, "task", "Add a thing")
+	path := workflow.ArtifactPath(w.env.TownRoot, w.env.Rig, id, "spec")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("stub missing: %v", err)
+	}
+	s := string(data)
+	for _, want := range []string{"id: " + id + "\n", "status: draft\n", "kind: task\n", "# Add a thing\n"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("stub missing %q:\n%s", want, s)
+		}
+	}
+	if strings.Contains(s, "parent:") {
+		t.Errorf("parent written though unset:\n%s", s)
+	}
+	fi, err := os.Stat(filepath.Dir(path))
+	if err != nil || fi.Mode().Perm() != 0o700 {
+		t.Errorf("item dir mode = %v, want 0700 (%v)", fi.Mode().Perm(), err)
+	}
+}
+
+func TestItemNew_ParentAndKinds(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	epic := newItemID(t, "epic", "Big")
+	if _, err := os.Stat(workflow.ArtifactPath(w.env.TownRoot, w.env.Rig, epic, "epic")); err != nil {
+		t.Errorf("epic stub: %v", err)
+	}
+	out, errOut, code := runWF(t, "item", "new", "fix", "Broken", "--parent", epic, "--json")
+	if code != 0 {
+		t.Fatalf("exit %d %q %q", code, out, errOut)
+	}
+	var v struct{ ID string }
+	_ = json.Unmarshal([]byte(out), &v)
+	data, err := os.ReadFile(workflow.ArtifactPath(w.env.TownRoot, w.env.Rig, v.ID, "report"))
+	if err != nil || !strings.Contains(string(data), "parent: "+epic+"\n") {
+		t.Errorf("fix stub %q: %v", data, err)
+	}
+}
+
+func TestItemNew_RejectsBadKindAndRig(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	called := false
+	newWorkflowEnv = func(*cobra.Command, string) (workflow.GateEnv, error) { called = true; return w.env, nil }
+
+	_, errOut, code := runWF(t, "item", "new", "story", "x")
+	if code != 1 || !strings.Contains(errOut, `unknown kind "story"`) {
+		t.Errorf("bad kind: exit %d %q", code, errOut)
+	}
+	_, errOut, code = runWF(t, "item", "new", "task", "x", "--rig", "../evil")
+	if code != 1 || !strings.Contains(errOut, `invalid rig name "../evil"`) {
+		t.Errorf("bad rig: exit %d %q", code, errOut)
+	}
+	if called {
+		t.Error("environment built before validation")
+	}
+}
+
+func TestWorkflowCmds_DisabledRig(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	id := newItemID(t, "task", "x")
+	w.env.Config.Enabled = false
+	want := "gated workflow is not enabled for rig r1 (set workflow.gated.enabled in settings/config.json)"
+	for _, args := range [][]string{{"advance", id}, {"item", "new", "task", "y"}, {"verdict", id, "spec", "eng", "approve"}, {"check", id}} {
+		_, errOut, code := runWF(t, args...)
+		if code != 1 || !strings.Contains(errOut, want) {
+			t.Errorf("%v: exit %d %q", args, code, errOut)
+		}
+	}
+	if _, errOut, code := runWF(t, "item", "show", id); code != 0 {
+		t.Errorf("item show on disabled rig: exit %d %q", code, errOut)
+	}
+	if _, errOut, code := runWF(t, "item", "list"); code != 0 {
+		t.Errorf("item list on disabled rig: exit %d %q", code, errOut)
+	}
+}
+
+func TestItemShow_JSON(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	id := newItemID(t, "task", "x")
+	out, errOut, code := runWF(t, "item", "show", id, "--json")
+	if code != 0 {
+		t.Fatalf("exit %d %q", code, errOut)
+	}
+	var v struct {
+		ID              string `json:"id"`
+		Rig             string `json:"rig"`
+		Kind            string `json:"kind"`
+		Step            string `json:"step"`
+		Title           string `json:"title"`
+		Parent          string `json:"parent"`
+		WaitingForHuman string `json:"waiting_for_human"`
+		Gate            struct {
+			Passed          bool     `json:"passed"`
+			Reasons         []string `json:"reasons"`
+			WaitingForHuman string   `json:"waiting_for_human"`
+		} `json:"gate"`
+		ArtifactPath string `json:"artifact_path"`
+		Artifacts    []struct {
+			Name   string `json:"name"`
+			Path   string `json:"path"`
+			SHA    string `json:"sha"`
+			Exists bool   `json:"exists"`
+		} `json:"artifacts"`
+	}
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatalf("not one JSON object: %q: %v", out, err)
+	}
+	specPath := workflow.ArtifactPath(w.env.TownRoot, "r1", id, "spec")
+	if v.ID != id || v.Rig != "r1" || v.Kind != "task" || v.Step != "spec" || v.Title != "x" {
+		t.Errorf("header fields: %+v", v)
+	}
+	if v.ArtifactPath != specPath {
+		t.Errorf("artifact_path = %q, want %q", v.ArtifactPath, specPath)
+	}
+	if v.Gate.Passed || v.Gate.WaitingForHuman != "approve spec" {
+		t.Errorf("gate = %+v", v.Gate)
+	}
+	names := []string{}
+	for _, a := range v.Artifacts {
+		names = append(names, a.Name)
+		if a.Name == "spec" && (!a.Exists || len(a.SHA) != 64 || a.Path != specPath) {
+			t.Errorf("spec artifact: %+v", a)
+		}
+		if a.Name == "plan" && (a.Exists || a.SHA != "") {
+			t.Errorf("plan artifact: %+v", a)
+		}
+	}
+	if strings.Join(names, ",") != "spec,plan,review" {
+		t.Errorf("artifacts = %v", names)
+	}
+
+	// At a step without an artifact, artifact_path is empty.
+	approveArtifact(t, w, id, "spec")
+	if _, _, code := runWF(t, "advance", id); code != 0 {
+		t.Fatal("advance to plan")
+	}
+	if err := os.WriteFile(workflow.ArtifactPath(w.env.TownRoot, "r1", id, "plan"), []byte("---\nstatus: draft\n---\n- [ ] step-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	approveArtifact(t, w, id, "plan")
+	if out, _, code := runWF(t, "advance", id); code != 0 {
+		t.Fatalf("advance to execute: %q", out)
+	}
+	out, _, _ = runWF(t, "item", "show", id, "--json")
+	v.ArtifactPath = "unset"
+	_ = json.Unmarshal([]byte(out), &v)
+	if v.Step != "execute" || v.ArtifactPath != "" {
+		t.Errorf("execute step: step=%s artifact_path=%q", v.Step, v.ArtifactPath)
+	}
+}
+
+func TestItemList_JSON(t *testing.T) {
+	useMemWorkflowEnv(t)
+	a := newItemID(t, "task", "a")
+	b := newItemID(t, "fix", "b")
+	out, _, code := runWF(t, "item", "list", "--json")
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	var v struct {
+		Rig   string `json:"rig"`
+		Items []struct {
+			ID   string `json:"id"`
+			Kind string `json:"kind"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.Rig != "r1" || len(v.Items) != 2 || v.Items[0].ID != a || v.Items[1].ID != b {
+		t.Errorf("list = %+v", v)
+	}
+}
+
+func TestVerdictCmd_Records(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	id := newItemID(t, "task", "x")
+	if out, errOut, code := runWF(t, "verdict", id, "spec", "eng", "concerns"); code != 0 {
+		t.Fatalf("exit %d %q %q", code, out, errOut)
+	}
+	as, _ := w.env.Store.Approvals(id)
+	if len(as) != 1 || as[0].Role != "eng" || as[0].Verdict != "concerns" || as[0].Actor != "tester" {
+		t.Errorf("approvals = %+v", as)
+	}
+	if _, _, code := runWF(t, "verdict", id, "spec", "human", "approve"); code != 1 {
+		t.Errorf("human role verdict: exit %d, want 1", code)
+	}
+}
+
+func TestRedCmd_NonMatchingGlob(t *testing.T) {
+	useMemWorkflowEnv(t)
+	id := newItemID(t, "task", "x")
+	_, errOut, code := runWF(t, "red", id, "step-1", "--tests", "nope/*_test.go", "--", "go", "test")
+	if code != 1 || !strings.Contains(errOut, `--tests glob "nope/*_test.go" matched no files`) {
+		t.Fatalf("exit %d %q", code, errOut)
+	}
+}
+
+type scriptRunner struct {
+	exits []int
+	calls [][]string
+}
+
+func (s *scriptRunner) Run(_ context.Context, _ string, argv []string) (int, string, error) {
+	s.calls = append(s.calls, argv)
+	e := s.exits[0]
+	s.exits = s.exits[1:]
+	return e, "tail-output", nil
+}
+
+func TestRedGreenCmd_Flow(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	id := newItemID(t, "task", "x")
+	if err := os.WriteFile(filepath.Join(w.checkout, "a_test.go"), []byte("package a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := &scriptRunner{exits: []int{0, 1, 0}}
+	oldRunner := workflowRunner
+	workflowRunner = func(workflow.GateEnv, string) workflow.Runner { return r }
+	t.Cleanup(func() { workflowRunner = oldRunner })
+
+	// A passing red is refused: exit 3 with the tail.
+	out, _, code := runWF(t, "red", id, "step-1", "--tests", "*_test.go", "--", "go", "test", "./...")
+	if code != 3 || !strings.Contains(out, "test passed before implementation") {
+		t.Fatalf("refused red: exit %d %q", code, out)
+	}
+	if out, errOut, code := runWF(t, "red", id, "step-1", "--tests", "*_test.go", "--", "go", "test", "./..."); code != 0 {
+		t.Fatalf("red: exit %d %q %q", code, out, errOut)
+	}
+	if out, errOut, code := runWF(t, "green", id, "step-1"); code != 0 {
+		t.Fatalf("green: exit %d %q %q", code, out, errOut)
+	}
+	if got := strings.Join(r.calls[1], " "); got != "go test ./..." {
+		t.Errorf("argv = %q", got)
+	}
+	runs, _ := w.env.Store.TDD(id)
+	if len(runs) != 3 || runs[1].Phase != "red" || runs[2].Phase != "green" || strings.Join(runs[1].TestFiles, ",") != "a_test.go" {
+		t.Errorf("runs = %+v", runs)
+	}
+}
+
+func TestCheckCmd_NotApproved(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	id := newItemID(t, "task", "x")
+	w.env.Config.CheckCommands = []string{"true"}
+	out, _, code := runWF(t, "check", id)
+	if code != 3 || !strings.Contains(out, "waiting for: approve check commands") {
+		t.Fatalf("exit %d %q", code, out)
+	}
+}
+
+func TestWorkflowCommandsRegistered(t *testing.T) {
+	for _, name := range []string{"item", "advance", "approve", "request-changes", "approve-checks", "verdict", "red", "green", "check"} {
+		n := 0
+		for _, c := range rootCmd.Commands() {
+			if c.Name() == name {
+				n++
+				if c.GroupID != GroupWork {
+					t.Errorf("%s group = %q, want %q", name, c.GroupID, GroupWork)
+				}
+			}
+		}
+		if n != 1 {
+			t.Errorf("top-level %q registered %d times, want 1", name, n)
+		}
+	}
+}
