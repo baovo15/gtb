@@ -25,8 +25,10 @@ TAG=$(git -C "$SRC" rev-parse --short HEAD)
 IMAGE="$REGISTRY/gtb:$TAG"
 
 step "Host volumes /var/lib/gtb (uid 1000, like gastown)"
-sudo mkdir -p /var/lib/gtb/dolt
-sudo chown 1000:1000 /var/lib/gtb
+# The pod mounts these as subPaths and runs as uid 1000; kubelet would create
+# missing ones as root, and `gt install` then cannot write /gt.
+sudo mkdir -p /var/lib/gtb/dolt /var/lib/gtb/town /var/lib/gtb/claude /var/lib/gtb/gt-home /var/lib/gtb/gt-state
+sudo chown 1000:1000 /var/lib/gtb /var/lib/gtb/town /var/lib/gtb/claude /var/lib/gtb/gt-home /var/lib/gtb/gt-state
 
 step "Build $IMAGE"
 docker build --platform linux/amd64 -t "$IMAGE" -t "$REGISTRY/gtb:latest" "$SRC"
