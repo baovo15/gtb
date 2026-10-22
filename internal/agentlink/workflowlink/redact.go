@@ -46,14 +46,49 @@ func RedactRemote(raw string) string {
 // whitespace or a quote.
 var urlInTextRe = regexp.MustCompile("[A-Za-z][A-Za-z0-9+.-]*://[^\\s'\"<>`]+")
 
-// RedactText applies RedactRemote to every URL in s. It is used for the
-// error text (sling/unsling output, git errors) a Result carries to the
-// server. A URL that cannot be cleaned is replaced by "<redacted-url>".
+// Bare-secret patterns (R37), applied after URL redaction. Each keeps its
+// first group and replaces the secret with "<redacted>".
+var secretRes = []*regexp.Regexp{
+	// Authorization: Bearer <x> / Basic <x>
+	regexp.MustCompile(`(?i)(authorization:\s*(?:bearer|basic)\s+)[^\s'"]+`),
+	// token=, access_token=, password=, passwd=, secret= and env-style
+	// *_TOKEN=, *_SECRET=, *_PASSWORD= (query or env style, quoted or not).
+	regexp.MustCompile(`(?i)(\b(?:[A-Za-z0-9_]*_(?:token|secret|password)|token|access_token|password|passwd|secret)=)(?:"[^"]*"|'[^']*'|[^\s&'"]+)`),
+	// user:secret@host without a scheme (x-access-token:<x>@github.com).
+	regexp.MustCompile(`(\b[A-Za-z0-9._-]+:)[^\s@:/'"]+(@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b)`),
+}
+
+// tokenRes match whole secrets that need no key (GitHub tokens).
+var tokenRes = []*regexp.Regexp{
+	regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9]{20,}`),
+	regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{20,}`),
+}
+
+// RedactText removes secrets from free-form text that leaves the machine
+// (command output tails, terminal captures, error messages):
+//   - every scheme://URL goes through RedactRemote (user info, query and
+//     fragment dropped; "<redacted-url>" when it cannot be cleaned);
+//   - "Authorization: Bearer|Basic <x>", key=value secrets (token,
+//     access_token, password, passwd, secret, *_TOKEN, *_SECRET,
+//     *_PASSWORD; case-insensitive) and "user:<x>@host" keep their key and
+//     have the value replaced by "<redacted>";
+//   - GitHub tokens (gh[pousr]_..., github_pat_...) become "<redacted>".
 func RedactText(s string) string {
-	return urlInTextRe.ReplaceAllStringFunc(s, func(m string) string {
+	s = urlInTextRe.ReplaceAllStringFunc(s, func(m string) string {
 		if r := RedactRemote(m); r != "" {
 			return r
 		}
 		return "<redacted-url>"
 	})
+	for _, re := range secretRes {
+		if re.NumSubexp() == 2 {
+			s = re.ReplaceAllString(s, "${1}<redacted>${2}")
+		} else {
+			s = re.ReplaceAllString(s, "${1}<redacted>")
+		}
+	}
+	for _, re := range tokenRes {
+		s = re.ReplaceAllString(s, "<redacted>")
+	}
+	return s
 }

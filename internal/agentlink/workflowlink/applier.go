@@ -300,7 +300,9 @@ func (a *WorkflowApplier) peek(ctx context.Context, r agentlink.Request) agentli
 	if err != nil {
 		return failed(agentlink.ErrCodeNotFound, err)
 	}
-	return agentlink.Result{OK: true, Data: mustJSON(map[string]string{"lines": lastBytes(out, maxPeekBytes)})}
+	// Redact before capping so a secret cut at the cap boundary cannot
+	// survive in part (R37).
+	return agentlink.Result{OK: true, Data: mustJSON(map[string]string{"lines": lastBytes(RedactText(out), maxPeekBytes)})}
 }
 
 // lastBytes returns the longest suffix of s of at most n bytes that starts on

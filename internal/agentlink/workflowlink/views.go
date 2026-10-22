@@ -43,11 +43,16 @@ func itemView(env workflow.GateEnv, it *workflow.Item, diff DiffStatFunc) agentl
 	}
 	iv := agentlink.ItemView{
 		ID: it.ID, Rig: rig, Kind: string(it.Kind), Step: string(step),
-		Title: it.Title, Parent: it.Parent, Branch: it.Branch,
+		// Title and branch are agent-writable and the diffstat paths are git
+		// output: redact them like any other free text (R37).
+		Title: RedactText(it.Title), Parent: it.Parent, Branch: RedactText(it.Branch),
 		WaitingForHuman: it.WaitingForHuman, StepEnteredAt: entered.UTC(),
 	}
 	if diff != nil && it.Branch != "" {
 		if fs, err := diff(rig, it.Branch); err == nil {
+			for i := range fs {
+				fs[i].Path = RedactText(fs[i].Path)
+			}
 			iv.Diffstat = fs
 		}
 	}
@@ -97,7 +102,8 @@ func viewHash(iv agentlink.ItemView) string {
 }
 
 // evidenceData projects a workflow evidence record into the JSON carried by
-// an evidence event.
+// an evidence event. Command lines and output tails are command output and
+// go through RedactText (R37).
 func evidenceData(data any) (json.RawMessage, bool) {
 	var m map[string]any
 	switch v := data.(type) {
@@ -108,13 +114,13 @@ func evidenceData(data any) (json.RawMessage, bool) {
 		}
 	case workflow.TDDRun:
 		m = map[string]any{
-			"kind": "tdd", "plan_step": v.PlanStep, "phase": v.Phase, "cmd": v.Cmd, "exit": v.Exit,
-			"tail": v.Tail, "source": v.Source, "provenance": v.Provenance, "at": v.At.UTC(),
+			"kind": "tdd", "plan_step": v.PlanStep, "phase": v.Phase, "cmd": RedactText(v.Cmd), "exit": v.Exit,
+			"tail": RedactText(v.Tail), "source": v.Source, "provenance": v.Provenance, "at": v.At.UTC(),
 		}
 	case workflow.CheckRun:
 		m = map[string]any{
 			"kind": "check", "cmd_set_sha": v.CmdSetSHA, "passed": v.Passed,
-			"tail": v.Tail, "source": v.Source, "provenance": v.Provenance, "at": v.At.UTC(),
+			"tail": RedactText(v.Tail), "source": v.Source, "provenance": v.Provenance, "at": v.At.UTC(),
 		}
 	default:
 		return nil, false

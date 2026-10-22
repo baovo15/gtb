@@ -74,7 +74,7 @@ type LoopConfig struct {
 // errors and 5xx answers end the session; Run reconnects after an
 // exponential backoff (BackoffMin doubling to BackoffMax, with jitter). The
 // backoff resets only after a full productive round (snapshot if needed,
-// flush, poll), not merely after hello.
+// flush, poll, results), not merely after hello.
 // Nothing queued is dropped: events stay in the outbox until acked.
 //
 // Snapshot cursor: a snapshot is the machine's whole state, so it supersedes
@@ -91,8 +91,8 @@ type LoopConfig struct {
 // stored result re-posted without calling Apply, even after ExpiresAt.
 // Otherwise a request whose ExpiresAt is not after Now answers
 // {ok:false, error:"expired"} without calling Apply. Every result is stored
-// before it is posted: in full for mutating requests, as {ok, error} only for
-// read-only ones, which are re-run if re-delivered. A successful "snapshot"
+// before it is posted for mutating requests; read-only ones are not recorded
+// and are re-run if re-delivered. A successful "snapshot"
 // request makes the loop resync.
 func Run(ctx context.Context, cfg LoopConfig) error {
 	if cfg.TownRoot == "" || cfg.ServerURL == "" || cfg.MachineID == "" || cfg.Token == "" || cfg.Collect == nil || cfg.Apply == nil {
@@ -184,7 +184,7 @@ func (l *loop) logf(format string, args ...any) { l.cfg.Logf(format, args...) }
 
 // session runs one connection until an error. productive reports whether at
 // least one full round succeeded: the snapshot when one was needed, the
-// flush, and a requests poll. Only then does the caller reset its backoff
+// flush, a requests poll and posting its results. Only then does the caller reset its backoff
 // (R35b), so a session that says hello but keeps failing (Collect, snapshot
 // or events) backs off like any other failure instead of retrying, and
 // re-collecting, every second.
@@ -232,10 +232,10 @@ func (l *loop) session(ctx context.Context) (productive bool, err error) {
 		if err != nil {
 			return productive, err
 		}
-		productive = true
 		if err := l.handle(ctx, reqs); err != nil {
 			return productive, err
 		}
+		productive = true // snapshot, flush, poll and results all succeeded
 	}
 }
 
@@ -411,8 +411,8 @@ var mutatingTypes = map[string]bool{
 // the expiry check (R35a): a mutating request that ran but whose result was
 // lost is re-delivered until it has one, possibly after ExpiresAt, and must
 // get the result of the run, not "expired". Read-only requests (snapshot,
-// inspect, terminal.peek) keep only {ok, error} in the set and are re-run
-// when re-delivered before expiry (R35c); re-running them is harmless.
+// inspect, terminal.peek) are not recorded at all and are re-run when
+// re-delivered before expiry (R35c, R37); re-running them is harmless.
 func (l *loop) apply(ctx context.Context, r Request) Result {
 	if res, ok := l.applied.Get(r.Key); ok && mutatingTypes[r.Type] {
 		l.logf("agentlink: request %s already applied; re-posting its result", r.Key)
@@ -429,12 +429,12 @@ func (l *loop) apply(ctx context.Context, r Request) Result {
 		l.logf("agentlink: result of request %s (%s) is too large to post", r.Key, r.Type)
 		res = Fail(r.Key, ErrCodeTooLarge)
 	}
-	stored := res
-	if !mutatingTypes[r.Type] {
-		stored = Result{Key: res.Key, OK: res.OK, Error: res.Error}
-	}
-	if err := l.applied.Put(stored); err != nil {
-		l.logf("agentlink: record applied request %s: %v", r.Key, err)
+	// Only mutating requests are recorded: read-only ones are re-run on
+	// re-delivery and must not push mutating keys out of the window.
+	if mutatingTypes[r.Type] {
+		if err := l.applied.Put(res); err != nil {
+			l.logf("agentlink: record applied request %s: %v", r.Key, err)
+		}
 	}
 	if r.Type == "snapshot" && res.OK {
 		l.resync = true

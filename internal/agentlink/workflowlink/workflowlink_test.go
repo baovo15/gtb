@@ -502,3 +502,83 @@ func TestApply_FailedSlingOutputRedacted(t *testing.T) {
 		t.Fatalf("result = %s", res.Data)
 	}
 }
+
+// R37: bare secrets in free text are masked; ordinary text is unchanged.
+func TestRedactText_Secrets(t *testing.T) {
+	gh := "ghp_" + strings.Repeat("A1b2", 9)
+	pat := "github_pat_" + strings.Repeat("Ab1_", 8)
+	cases := []struct{ in, want string }{
+		{"Authorization: Bearer abc.def.ghi", "Authorization: Bearer <redacted>"},
+		{"authorization: basic dXNlcjpwYXNz rest", "authorization: basic <redacted> rest"},
+		{"curl -H 'Authorization: Bearer xyz' url", "curl -H 'Authorization: Bearer <redacted>' url"},
+		{"token=abc123", "token=<redacted>"},
+		{"?a=1&access_token=abc&b=2", "?a=1&access_token=<redacted>&b=2"},
+		{"PASSWORD=hunter2 next", "PASSWORD=<redacted> next"},
+		{"passwd=x", "passwd=<redacted>"},
+		{"secret=s3cr3t", "secret=<redacted>"},
+		{"GH_TOKEN=abc go test", "GH_TOKEN=<redacted> go test"},
+		{"export NPM_TOKEN=\"quoted value\"", "export NPM_TOKEN=<redacted>"},
+		{"AWS_SECRET=xyz DB_PASSWORD='p w'", "AWS_SECRET=<redacted> DB_PASSWORD=<redacted>"},
+		{"using " + gh + " now", "using <redacted> now"},
+		{"pat " + pat, "pat <redacted>"},
+		{"https://x-access-token:SECRET@github.com/o/r.git", "https://github.com/o/r.git"},
+		{"x-access-token:SECRET@github.com", "x-access-token:<redacted>@github.com"},
+		{"oauth2:glpat-abc@gitlab.com/o/r", "oauth2:<redacted>@gitlab.com/o/r"},
+	}
+	for _, c := range cases {
+		if got := RedactText(c.in); got != c.want {
+			t.Errorf("RedactText(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	for _, keep := range []string{
+		"exit status 1",
+		"--- FAIL: TestToken (0.01s)",
+		"token expired; run gtb join again",
+		"max_tokens=4096 input_tokens=12",
+		"TOKEN_COUNT=3",
+		"password policy: at least 12 characters",
+		"secrets.go:12: undefined: Foo",
+		"Authorization required",
+		"git@github.com:o/r.git",
+		"ok  github.com/x/y 0.12s",
+		"ghp_short",
+		"a=b c=d",
+	} {
+		if got := RedactText(keep); got != keep {
+			t.Errorf("RedactText(%q) = %q, want unchanged", keep, got)
+		}
+	}
+}
+
+// R37: evidence cmd/tail, peek lines, titles and diffstat paths are redacted
+// before they leave the machine.
+func TestOutgoingFreeTextRedacted(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("Z9", 15)
+	tdd, _ := evidenceData(workflow.TDDRun{ItemID: "i", Cmd: `["go","test","-token=` + secret + `"]`, Tail: "fetch https://u:" + secret + "@h/r.git failed"})
+	chk, _ := evidenceData(workflow.CheckRun{ItemID: "i", Tail: "GH_TOKEN=" + secret})
+	for _, b := range []json.RawMessage{tdd, chk} {
+		if strings.Contains(string(b), secret) || !strings.Contains(string(b), "redacted") && !strings.Contains(string(b), "https://h/r.git") {
+			t.Fatalf("evidence not redacted: %s", b)
+		}
+	}
+	f := newFixture(t)
+	id, _ := f.item(t, "x\n")
+	f.peeked = "$ git push\nremote: https://bot:" + secret + "@github.com/o/r.git\n" + strings.Repeat("y", 70<<10)
+	res := f.app.Apply(context.Background(), req("terminal.peek", id, nil))
+	if strings.Contains(string(res.Data), secret) {
+		t.Fatal("peek lines not redacted")
+	}
+	f.peeked = "token=" + secret
+	res = f.app.Apply(context.Background(), req("terminal.peek", id, nil))
+	if strings.Contains(string(res.Data), secret) || !strings.Contains(string(res.Data), `token=\u003credacted\u003e`) {
+		t.Fatalf("peek = %s", res.Data)
+	}
+	it, _ := f.env.Items.Create("r", workflow.KindTask, "rotate "+secret, "")
+	it.Branch = "b"
+	iv := itemView(f.env, it, func(string, string) ([]agentlink.FileStat, error) {
+		return []agentlink.FileStat{{Path: "conf/token=" + secret}}, nil
+	})
+	if b, _ := json.Marshal(iv); strings.Contains(string(b), secret) {
+		t.Fatalf("item view leaks: %s", b)
+	}
+}

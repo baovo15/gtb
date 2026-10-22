@@ -36,6 +36,8 @@ type loopFixture struct {
 
 	failFirst   atomic.Int32 // remaining calls to answer 503
 	failResults atomic.Int32 // remaining POST /results calls to answer 503
+	helloMu     sync.Mutex
+	helloAt     []time.Time // time of every POST /hello that reached the fixture
 
 	mu        sync.Mutex
 	calls     []string // path of every call that reached the API
@@ -62,6 +64,11 @@ func newLoopFixture(t *testing.T) *loopFixture {
 	}
 	api := server.NewAgentAPI(st, func() time.Time { return f.now })
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/agent/v1/hello" {
+			f.helloMu.Lock()
+			f.helloAt = append(f.helloAt, time.Now())
+			f.helloMu.Unlock()
+		}
 		if r.URL.Path == "/agent/v1/results" && f.failResults.Load() > 0 {
 			f.failResults.Add(-1)
 			http.Error(w, `{"error":"unavailable"}`, http.StatusServiceUnavailable)
@@ -688,7 +695,8 @@ func gaps(ts []time.Time) []time.Duration {
 	return out
 }
 
-// R35c: read-only requests keep only {ok, error} in the applied set; mutating
+// R35c/R37: read-only requests are not recorded in the applied set at all
+// (they must not push mutating keys out of the 10k window); mutating
 // requests keep the full result.
 func TestAgentLoop_AppliedSetStoresOnlyMutatingResults(t *testing.T) {
 	f := newLoopFixture(t)
@@ -708,10 +716,12 @@ func TestAgentLoop_AppliedSetStoresOnlyMutatingResults(t *testing.T) {
 	}
 	set, _ := agentlink.OpenAppliedSet(f.town, 100)
 	for _, typ := range []string{"inspect", "terminal.peek", "snapshot"} {
-		r, ok := set.Get("k-" + typ)
-		if !ok || !r.OK || (len(r.Data) != 0 && string(r.Data) != "null") {
-			t.Fatalf("%s stored = %+v %v, want {ok} without data", typ, r, ok)
+		if r, ok := set.Get("k-" + typ); ok {
+			t.Fatalf("read-only %s recorded in the applied set: %+v", typ, r)
 		}
+	}
+	if n := set.Len(); n != 2 {
+		t.Fatalf("applied set holds %d keys, want 2 (mutating only)", n)
 	}
 	for _, typ := range []string{"approve", "item.create"} {
 		if r, ok := set.Get("k-" + typ); !ok || len(r.Data) < 1000 {
@@ -738,5 +748,27 @@ func TestAgentLoop_ReadOnlyRedeliveryReruns(t *testing.T) {
 	}
 	if r := resultFor(t, f, "k-peek"); string(r.Data) != `{"lines":"fresh"}` {
 		t.Fatalf("result = %+v", r)
+	}
+}
+
+// R37: a session whose results POST keeps failing is not productive, so the
+// backoff grows instead of resetting after every hello.
+func TestAgentLoop_BackoffGrowsWhenResultsFail(t *testing.T) {
+	f := newLoopFixture(t)
+	f.now = time.Now().UTC()
+	f.store.ApplySnapshot(testMachine, agentlink.Snapshot{})
+	enqueue(t, f, agentlink.Request{Key: "k-i", Type: "inspect", ItemID: "x", ExpiresAt: f.now.Add(time.Hour)})
+	f.failResults.Store(1 << 20)
+	cfg := f.config(&countingApplier{}, &logBuf{})
+	cfg.BackoffMin, cfg.BackoffMax = 20*time.Millisecond, 400*time.Millisecond
+	stop := run(t, cfg)
+	eventually(t, "6 hellos", func() bool { f.helloMu.Lock(); defer f.helloMu.Unlock(); return len(f.helloAt) >= 6 })
+	stop()
+	f.helloMu.Lock()
+	defer f.helloMu.Unlock()
+	// Each session also waits PollWait (50ms) for the re-delivery; without
+	// the fix every gap is ~50-70ms. With doubling, the 5th gap is >= 210ms.
+	if gap := f.helloAt[5].Sub(f.helloAt[4]); gap < 150*time.Millisecond {
+		t.Fatalf("backoff did not grow: gaps %v", gaps(f.helloAt))
 	}
 }
