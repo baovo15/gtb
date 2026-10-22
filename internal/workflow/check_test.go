@@ -114,3 +114,32 @@ func TestCapTail(t *testing.T) {
 		t.Fatalf("odd budget: len %d", len(got))
 	}
 }
+
+// R39: a multi-line command is flattened so the failing tail's command
+// prefix is exactly one line.
+func TestCapTail_MultiLineCommandOneLinePrefix(t *testing.T) {
+	for cmd, want := range map[string]string{
+		"set -e\nmake test": "set -e ⏎ make test\n",
+		"a\r\nb\rc\nd":      "a ⏎ b ⏎ c ⏎ d\n",
+		"go test ./...":     "go test ./...\n",
+		"trailing\n":        "trailing ⏎ \n",
+	} {
+		got := capTail(cmd, "out1\nout2")
+		if got != want+"out1\nout2" {
+			t.Fatalf("capTail(%q) = %q", cmd, got)
+		}
+	}
+	env, dir := tddEnv(t)
+	approvedChecks(env, "set -e\nmake test")
+	r := &fakeRunner{results: []fakeResult{{exit: 1, tail: "FAIL x"}}}
+	c, err := Check(env, r, "it-1", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Tail != "set -e ⏎ make test\nFAIL x" || c.CmdSetSHA != CheckCommandsSHA([]string{"set -e\nmake test"}) {
+		t.Fatalf("check = %+v", c)
+	}
+	if want := []string{"sh", "-c", "set -e\nmake test"}; !reflect.DeepEqual(r.calls[0].argv, want) {
+		t.Fatalf("argv = %q, the command itself must run unchanged", r.calls[0].argv)
+	}
+}

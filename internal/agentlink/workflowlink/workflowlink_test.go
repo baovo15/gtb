@@ -681,3 +681,42 @@ func TestPeek_CutLineDropped(t *testing.T) {
 		t.Fatalf("lines = %d bytes, want the %d-byte body", len(pk.Lines), len(body))
 	}
 }
+
+// checkRunner is a workflow.Runner returning one fixed result.
+type checkRunner struct {
+	exit int
+	tail string
+}
+
+func (r checkRunner) Run(context.Context, string, []string) (int, string, error) {
+	return r.exit, r.tail, nil
+}
+
+// R39: a multi-line check command must not shift checkTail's split into the
+// command, or the output's cut first line is sent.
+func TestEvidenceTail_MultiLineCheckCommand(t *testing.T) {
+	cmd := "set -e\nmake test"
+	// Sized so the pre-R39 prefix ("set -e\nmake test\n", 17 bytes) leaves a
+	// 983-byte budget whose cut lands inside DB_PASSWORD.
+	kept := "SSWORD=hunter2 x\n" + strings.Repeat("line\n", 50)
+	kept = padTo(kept, workflow.TailBytes-len(cmd+"\n"))
+	out := "export DB_PA" + kept
+	cmds := []string{cmd}
+	env := workflow.GateEnv{
+		TownRoot: t.TempDir(), Rig: "r",
+		Store: workflow.NewMemStore(), Items: workflow.NewMemItems(),
+		Config: &config.GatedWorkflow{Enabled: true, CheckCommands: cmds, CheckCommandsApprovedSHA: workflow.CheckCommandsSHA(cmds)},
+		Now:    func() time.Time { return t0 },
+	}
+	run, err := workflow.Check(env, checkRunner{exit: 1, tail: out}, "it-1", t.TempDir())
+	if err != nil || run.Passed {
+		t.Fatalf("Check: %+v %v", run, err)
+	}
+	b, _ := evidenceData(run)
+	if strings.Contains(string(b), "hunter2") {
+		t.Fatalf("leaked: %.160s", b)
+	}
+	if !strings.Contains(string(b), `"tail":"set -e ⏎ make test\nline`) {
+		t.Fatalf("command line not kept as one line: %.160s", b)
+	}
+}

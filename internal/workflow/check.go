@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // ErrChecksNotApproved is returned by Check when the rig's check commands do
@@ -55,10 +56,16 @@ func Check(env GateEnv, r Runner, itemID, dir string) (CheckRun, error) {
 	return run, nil
 }
 
+// cmdLineFlattener turns a multi-line check command into one line (R39).
+var cmdLineFlattener = strings.NewReplacer("\r\n", " ⏎ ", "\n", " ⏎ ", "\r", " ⏎ ")
+
 // capTail joins cmd, "\n" and out into at most tailBytes bytes without
-// splitting a rune. It keeps as much of the start of cmd as fits (the
-// newline included), then fills the remaining budget with the end of out.
+// splitting a rune. Newlines in cmd are flattened to " ⏎ " so the command
+// prefix is always exactly one line and the first "\n" always ends it
+// (R39; workflowlink splits there). It keeps as much of the start of cmd as
+// fits (the newline included), then fills the remaining budget with the end
+// of out.
 func capTail(cmd, out string) string {
-	prefix := FirstBytes(cmd+"\n", tailBytes)
+	prefix := FirstBytes(cmdLineFlattener.Replace(cmd)+"\n", tailBytes)
 	return prefix + lastBytes(out, tailBytes-len(prefix))
 }
