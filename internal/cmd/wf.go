@@ -100,13 +100,13 @@ var newWorkflowEnv = func(cmd *cobra.Command, rigName string) (workflow.GateEnv,
 
 	// Git is left nil: commands that need the item's checkout attach it
 	// through requireCheckout, and the fix gate fails on a nil Git.
-	return workflow.GateEnv{
+	return observeIfJoined(workflow.GateEnv{
 		TownRoot: townRoot,
 		Rig:      rigName,
 		Store:    store,
 		Items:    workflow.NewBeadsItems(beads.New(rigPath)),
 		Config:   cfg,
-	}, nil
+	}), nil
 }
 
 // workflowCheckoutDir returns the item's worktree: the git toplevel of the

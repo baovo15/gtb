@@ -30,3 +30,16 @@ func (f ApplierFunc) Apply(ctx context.Context, r Request) Result { return f(ctx
 
 // Fail returns a failed Result for key with code.
 func Fail(key, code string) Result { return Result{Key: key, OK: false, Error: code} }
+
+// DisableEnv is the environment variable that turns the machine link off:
+// GTB_AGENTLINK=0 stops the daemon loop and the CLI event hooks.
+const DisableEnv = "GTB_AGENTLINK"
+
+// Disabled reports whether GTB_AGENTLINK=0 (or false/off) is set.
+func Disabled(getenv func(string) string) bool {
+	switch getenv(DisableEnv) {
+	case "0", "false", "off", "no":
+		return true
+	}
+	return false
+}

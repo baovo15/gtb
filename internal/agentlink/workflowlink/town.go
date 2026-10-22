@@ -322,7 +322,7 @@ func (t *Town) Applier(q *agentlink.Queue, exe string) *WorkflowApplier {
 		Sling: func(ctx context.Context, itemID, rigName string) error {
 			return t.ExecGtb(ctx, exe, "sling", itemID, rigName)
 		},
-		Cancel: func(ctx context.Context, itemID string) error { return t.cancel(ctx, exe, itemID) },
+		Cancel:   func(ctx context.Context, itemID string) error { return t.cancel(ctx, exe, itemID) },
 		Peek:     t.Peek,
 		DiffStat: t.DiffStat,
 	}

@@ -59,10 +59,9 @@ func (o *ObserverAdapter) OnEvent(kind, itemID string, data any) {
 			return
 		}
 		iv := itemView(o.env, it, o.diff)
-		iv.Step, iv.StepEnteredAt = string(tr.To), tr.At.UTC()
-		if tr.To != "" {
-			iv.WaitingForHuman = "" // Advance clears it right after
-		}
+		// Advance clears the waiting reason right after; SetWaiting then
+		// queues another upsert, so the server never keeps a stale wait.
+		iv.Step, iv.StepEnteredAt, iv.WaitingForHuman = string(tr.To), tr.At.UTC(), ""
 		o.append(agentlink.EventItemUpsert, itemID, mustJSON(iv))
 	case workflow.EventEvidence:
 		if b, ok := evidenceData(data); ok {
