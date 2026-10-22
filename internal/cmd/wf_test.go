@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,9 +20,10 @@ import (
 // wfTestEnv is the in-memory workflow environment injected through
 // newWorkflowEnv for command tests. Nothing here touches Dolt, bd or git.
 type wfTestEnv struct {
-	env      workflow.GateEnv
-	checkout string
-	gotRig   string
+	env          workflow.GateEnv
+	checkout     string
+	gotRig       string
+	realCheckout func(string, string) (string, error)
 }
 
 func useMemWorkflowEnv(t *testing.T) *wfTestEnv {
@@ -37,14 +40,18 @@ func useMemWorkflowEnv(t *testing.T) *wfTestEnv {
 		},
 		checkout: t.TempDir(),
 	}
-	oldEnv, oldDir, oldActor := newWorkflowEnv, workflowCheckoutDir, workflowActor
+	oldEnv, oldDir, oldActor, oldBranch := newWorkflowEnv, workflowCheckoutDir, workflowActor, workflowBranch
+	w.realCheckout = oldDir
 	newWorkflowEnv = func(_ *cobra.Command, rig string) (workflow.GateEnv, error) {
 		w.gotRig = rig
 		return w.env, nil
 	}
-	workflowCheckoutDir = func(string, string) string { return w.checkout }
+	workflowCheckoutDir = func(string, string) (string, error) { return w.checkout, nil }
 	workflowActor = func() string { return "tester" }
-	t.Cleanup(func() { newWorkflowEnv, workflowCheckoutDir, workflowActor = oldEnv, oldDir, oldActor })
+	workflowBranch = func(string) string { return "polecat/x" }
+	t.Cleanup(func() {
+		newWorkflowEnv, workflowCheckoutDir, workflowActor, workflowBranch = oldEnv, oldDir, oldActor, oldBranch
+	})
 	return w
 }
 
@@ -211,7 +218,7 @@ func TestApproveChecks_WritesSHA(t *testing.T) {
 	w.env.Config.CheckCommands = cmds
 	term := &yesTerminal{}
 	oldTerm := workflowTerminal
-	workflowTerminal = func() workflow.Terminal { return term }
+	workflowTerminal = func(io.Writer) workflow.Terminal { return term }
 	t.Cleanup(func() { workflowTerminal = oldTerm })
 
 	out, errOut, code := runWF(t, "approve-checks")
@@ -499,5 +506,246 @@ func TestWorkflowCommandsRegistered(t *testing.T) {
 		if n != 1 {
 			t.Errorf("top-level %q registered %d times, want 1", name, n)
 		}
+	}
+}
+
+// ---- fix round 1 ----
+
+func gitInit(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "init", "-q", dir).CombinedOutput(); err != nil {
+		t.Fatalf("git init %s: %v %s", dir, err, out)
+	}
+}
+
+func TestResolveCheckout(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	town := t.TempDir()
+	rigPath := filepath.Join(town, "r1")
+	gitInit(t, rigPath) // adopted rig whose root is a repo
+	gitInit(t, filepath.Join(rigPath, "mayor", "rig"))
+	gitInit(t, filepath.Join(rigPath, "refinery", "rig"))
+	polecat := filepath.Join(rigPath, "polecats", "p1", "r1")
+	gitInit(t, polecat)
+	plain := filepath.Join(t.TempDir(), "plain")
+	if err := os.MkdirAll(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, cwd := range map[string]string{
+		"rig root":     rigPath,
+		"mayor/rig":    filepath.Join(rigPath, "mayor", "rig"),
+		"refinery/rig": filepath.Join(rigPath, "refinery", "rig"),
+		"outside rig":  plain,
+	} {
+		if dir, err := resolveCheckout(town, "r1", cwd); err == nil || !strings.Contains(err.Error(), "run from the item's worktree (polecat or crew checkout); got ") {
+			t.Errorf("%s: dir=%q err=%v, want refusal", name, dir, err)
+		}
+	}
+	sub := filepath.Join(polecat, "pkg")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := resolveCheckout(town, "r1", sub)
+	if err != nil || !samePath(dir, polecat) {
+		t.Errorf("polecat worktree: dir=%q err=%v, want %s", dir, err, polecat)
+	}
+}
+
+func TestPathWithin(t *testing.T) {
+	d := t.TempDir()
+	for _, c := range []struct {
+		dir, p string
+		want   bool
+	}{
+		{d, d, true},
+		{d, filepath.Join(d, "a", "b"), true},
+		{filepath.Join(d, "a"), filepath.Join(d, "ab"), false},
+		{filepath.Join(d, "a"), d, false},
+	} {
+		if got := pathWithin(c.dir, c.p); got != c.want {
+			t.Errorf("pathWithin(%q, %q) = %v", c.dir, c.p, got)
+		}
+	}
+}
+
+// TestGitCommands_RequireWorktree runs red/green/check and advance-at-fix
+// through the real checkout resolution from the rig root and mayor/rig
+// (refused) and from a polecat worktree (accepted).
+func TestGitCommands_RequireWorktree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	w := useMemWorkflowEnv(t)
+	workflowCheckoutDir = w.realCheckout
+	w.env.Config.CheckCommands = []string{"true"}
+	w.env.Config.CheckCommandsApprovedSHA = workflow.CheckCommandsSHA(w.env.Config.CheckCommands)
+	// Create items before the rig root becomes a repo (item new refuses
+	// artifact dirs inside a worktree).
+	id := newItemID(t, "task", "x")
+	fix := newItemID(t, "fix", "f")
+	rigPath := filepath.Join(w.env.TownRoot, "r1")
+	gitInit(t, rigPath)
+	mayor := filepath.Join(rigPath, "mayor", "rig")
+	gitInit(t, mayor)
+	polecat := filepath.Join(rigPath, "polecats", "p1", "r1")
+	gitInit(t, polecat)
+	if err := os.WriteFile(filepath.Join(polecat, "a_test.go"), []byte("package a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := &scriptRunner{exits: []int{1, 0, 0, 0}} // red, green, check, check
+	oldRunner := workflowRunner
+	workflowRunner = func(workflow.GateEnv, string) workflow.Runner { return r }
+	t.Cleanup(func() { workflowRunner = oldRunner })
+
+	for _, tr := range [][2]workflow.Step{{"report", "reproduce"}, {"reproduce", "rca"}, {"rca", "fix"}} {
+		if err := w.env.Store.Transition(fix, tr[0], tr[1], "t"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmds := [][]string{
+		{"red", id, "step-1", "--tests", "*_test.go", "--", "go", "test"},
+		{"green", id, "step-1"},
+		{"check", id},
+		{"advance", fix},
+	}
+	for _, cwd := range []string{rigPath, mayor} {
+		t.Chdir(cwd)
+		for _, args := range cmds {
+			_, errOut, code := runWF(t, args...)
+			if code != 1 || !strings.Contains(errOut, "run from the item's worktree (polecat or crew checkout); got ") {
+				t.Errorf("cwd %s %v: exit %d %q", cwd, args[0], code, errOut)
+			}
+		}
+	}
+	if len(r.calls) != 0 {
+		t.Fatalf("runner called from a refused cwd: %v", r.calls)
+	}
+
+	t.Chdir(polecat)
+	for _, args := range cmds[:3] {
+		// --json goes first: anything after "--" is red's argv.
+		out, errOut, code := runWF(t, append([]string{args[0], "--json"}, args[1:]...)...)
+		if code != 0 {
+			t.Fatalf("%v from polecat: exit %d %q %q", args[0], code, out, errOut)
+		}
+		var v struct {
+			Checkout struct{ Dir, Branch string }
+		}
+		if err := json.Unmarshal([]byte(out), &v); err != nil || !samePath(v.Checkout.Dir, polecat) || v.Checkout.Branch != "polecat/x" {
+			t.Errorf("%v checkout = %+v (%v)", args[0], v.Checkout, err)
+		}
+	}
+	out, _, code := runWF(t, "check", id)
+	if code != 0 || !strings.Contains(out, "checkout: ") || !strings.Contains(out, "(polecat/x)") {
+		t.Errorf("human checkout line: exit %d %q", code, out)
+	}
+	// advance at fix is accepted from the worktree (the gate itself then
+	// refuses on missing repro evidence, which is exit 3 not 1).
+	out, errOut, code := runWF(t, "advance", fix, "--json")
+	if code != 3 || !strings.Contains(out, `"checkout"`) {
+		t.Errorf("advance at fix from polecat: exit %d %q %q", code, out, errOut)
+	}
+}
+
+// TestAdvance_NonFixStepNeedsNoCheckout: advance at other steps never
+// resolves a checkout.
+func TestAdvance_NonFixStepNeedsNoCheckout(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	workflowCheckoutDir = func(string, string) (string, error) {
+		t.Error("checkout resolved for a non-fix step")
+		return "", errNotWorktree("x")
+	}
+	id := newItemID(t, "task", "x")
+	approveArtifact(t, w, id, "spec")
+	if out, errOut, code := runWF(t, "advance", id); code != 0 || strings.Contains(out, "checkout:") {
+		t.Errorf("exit %d %q %q", code, out, errOut)
+	}
+}
+
+// TestFixGate_NilGitFails: with no Git source the fix gate refuses rather
+// than passing the changed-files budget.
+func TestFixGate_NilGitFails(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	w.env.Git = nil
+	fix := newItemID(t, "fix", "f")
+	for _, tr := range [][2]workflow.Step{{"report", "reproduce"}, {"reproduce", "rca"}, {"rca", "fix"}} {
+		if err := w.env.Store.Transition(fix, tr[0], tr[1], "t"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	it, _ := w.env.Items.Get(fix)
+	res := workflow.Gate(w.env, it)
+	if res.Passed || !strings.Contains(strings.Join(res.Reasons, "|"), "changed files: no git source configured") {
+		t.Errorf("gate = %+v", res)
+	}
+}
+
+type recordingTerminal struct{ out io.Writer }
+
+func (r recordingTerminal) IsTTY() bool { return true }
+func (r recordingTerminal) Confirm(p string) (bool, error) {
+	_, err := io.WriteString(r.out, p+" ")
+	return true, err
+}
+
+// TestHumanCmds_JSONStdoutOnlyJSON: under --json the prompt goes to stderr
+// and stdout holds exactly one JSON object.
+func TestHumanCmds_JSONStdoutOnlyJSON(t *testing.T) {
+	w := useMemWorkflowEnv(t)
+	clearAgentMarkers(t)
+	cmds := []string{"true"}
+	rigPath := filepath.Join(w.env.TownRoot, w.env.Rig)
+	settings := config.NewRigSettings()
+	settings.Workflow = &config.WorkflowConfig{Gated: &config.GatedWorkflow{Enabled: true, CheckCommands: cmds}}
+	if err := config.SaveRigSettings(config.RigSettingsPath(rigPath), settings); err != nil {
+		t.Fatal(err)
+	}
+	oldTerm := workflowTerminal
+	workflowTerminal = func(out io.Writer) workflow.Terminal { return recordingTerminal{out: out} }
+	t.Cleanup(func() { workflowTerminal = oldTerm })
+	id := newItemID(t, "task", "x")
+
+	for _, args := range [][]string{{"approve", id, "spec"}, {"request-changes", id, "spec"}, {"approve-checks"}} {
+		out, errOut, code := runWF(t, append(args, "--json")...)
+		if code != 0 {
+			t.Fatalf("%v: exit %d %q %q", args, code, out, errOut)
+		}
+		dec := json.NewDecoder(strings.NewReader(out))
+		var v map[string]any
+		if err := dec.Decode(&v); err != nil {
+			t.Fatalf("%v: stdout not JSON: %q", args, out)
+		}
+		if dec.More() {
+			t.Errorf("%v: stdout has more than one JSON value: %q", args, out)
+		}
+		if strings.Contains(out, "[y/N]") || !strings.Contains(errOut, "[y/N]") {
+			t.Errorf("%v: prompt on wrong stream: stdout=%q stderr=%q", args, out, errOut)
+		}
+	}
+}
+
+// TestItemNew_RefusesArtifactDirInsideRepo: adopted rigs whose root is a
+// repo must not get artifacts written into the repo.
+func TestItemNew_RefusesArtifactDirInsideRepo(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	w := useMemWorkflowEnv(t)
+	gitInit(t, filepath.Join(w.env.TownRoot, "r1"))
+	_, errOut, code := runWF(t, "item", "new", "task", "x")
+	if code != 1 || !strings.Contains(errOut, "is inside git worktree ") || !strings.Contains(errOut, "; gtb keeps artifacts outside repos") {
+		t.Fatalf("exit %d %q", code, errOut)
+	}
+	if items, _ := w.env.Items.List("r1"); len(items) != 0 {
+		t.Errorf("bead created before refusal: %+v", items)
+	}
+	if _, err := os.Stat(filepath.Join(w.env.TownRoot, "r1", ".gtb")); !os.IsNotExist(err) {
+		t.Errorf(".gtb created inside the repo: %v", err)
 	}
 }

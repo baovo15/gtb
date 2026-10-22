@@ -98,50 +98,96 @@ var newWorkflowEnv = func(cmd *cobra.Command, rigName string) (workflow.GateEnv,
 		return workflow.GateEnv{}, err
 	}
 
-	repoDir := workflowCheckoutDir(townRoot, rigName)
-	base := "origin/main"
-	if rc, err := rig.LoadRigConfig(rigPath); err == nil && rc.DefaultBranch != "" {
-		base = "origin/" + rc.DefaultBranch
-	}
+	// Git is left nil: commands that need the item's checkout attach it
+	// through requireCheckout, and the fix gate fails on a nil Git.
 	return workflow.GateEnv{
 		TownRoot: townRoot,
 		Rig:      rigName,
 		Store:    store,
 		Items:    workflow.NewBeadsItems(beads.New(rigPath)),
 		Config:   cfg,
-		Git: workflow.GitChangedFiles{
-			RepoDir: repoDir,
-			Base:    base,
-			Branch: func(string) string {
-				b, err := git.NewGit(repoDir).CurrentBranch()
-				if err != nil || b == "" {
-					return "HEAD"
-				}
-				return b
-			},
-		},
 	}, nil
 }
 
-// workflowCheckoutDir returns the item's working checkout: the git toplevel
-// of the current directory when it lies inside the rig, else the rig's
-// mayor/rig clone.
-var workflowCheckoutDir = func(townRoot, rigName string) string {
-	rigPath := filepath.Join(townRoot, rigName)
-	fallback := filepath.Join(rigPath, "mayor", "rig")
+// workflowCheckoutDir returns the item's worktree: the git toplevel of the
+// current directory, which must be a worktree under <townRoot>/<rig>/ other
+// than the rig root itself, mayor/rig or refinery/rig. There is no fallback.
+var workflowCheckoutDir = func(townRoot, rigName string) (string, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
-		return fallback
+		return "", err
 	}
-	out, err := exec.Command("git", "-C", cwd, "rev-parse", "--show-toplevel").Output()
+	return resolveCheckout(townRoot, rigName, cwd)
+}
+
+// resolveCheckout implements workflowCheckoutDir for an explicit cwd.
+func resolveCheckout(townRoot, rigName, cwd string) (string, error) {
+	top, ok := gitToplevel(cwd)
+	if !ok {
+		return "", errNotWorktree(cwd)
+	}
+	rigPath := filepath.Join(townRoot, rigName)
+	if !pathWithin(rigPath, top) || samePath(rigPath, top) {
+		return "", errNotWorktree(top)
+	}
+	for _, shared := range []string{filepath.Join(rigPath, "mayor", "rig"), filepath.Join(rigPath, "refinery", "rig")} {
+		if pathWithin(shared, top) {
+			return "", errNotWorktree(top)
+		}
+	}
+	return top, nil
+}
+
+func errNotWorktree(dir string) error {
+	return fmt.Errorf("run from the item's worktree (polecat or crew checkout); got %s", dir)
+}
+
+// gitToplevel returns the toplevel of the git worktree containing dir.
+func gitToplevel(dir string) (string, bool) {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--show-toplevel").Output()
 	if err != nil {
-		return fallback
+		return "", false
 	}
 	top := strings.TrimSpace(string(out))
-	if top == "" || !pathWithin(rigPath, top) {
-		return fallback
+	return top, top != ""
+}
+
+// workflowBranch returns the checked-out branch of dir ("HEAD" if detached
+// or unknown).
+var workflowBranch = func(dir string) string {
+	b, err := git.NewGit(dir).CurrentBranch()
+	if err != nil || b == "" {
+		return "HEAD"
 	}
-	return top
+	return b
+}
+
+// checkoutInfo is the worktree a command ran against.
+type checkoutInfo struct {
+	Dir    string `json:"dir"`
+	Branch string `json:"branch"`
+}
+
+func (c checkoutInfo) line() string { return fmt.Sprintf("checkout: %s (%s)\n", c.Dir, c.Branch) }
+
+// requireCheckout resolves the item's worktree from the cwd (R15) and, when
+// env has no Git source yet, attaches one diffing the rig's default branch
+// against the worktree's branch.
+func requireCheckout(env *workflow.GateEnv) (checkoutInfo, error) {
+	dir, err := workflowCheckoutDir(env.TownRoot, env.Rig)
+	if err != nil {
+		return checkoutInfo{}, err
+	}
+	co := checkoutInfo{Dir: dir, Branch: workflowBranch(dir)}
+	if env.Git == nil {
+		base := "origin/main"
+		if rc, err := rig.LoadRigConfig(filepath.Join(env.TownRoot, env.Rig)); err == nil && rc.DefaultBranch != "" {
+			base = "origin/" + rc.DefaultBranch
+		}
+		branch := co.Branch
+		env.Git = workflow.GitChangedFiles{RepoDir: dir, Base: base, Branch: func(string) string { return branch }}
+	}
+	return co, nil
 }
 
 // workflowActor names whoever runs the command: git user.name, else $USER.
@@ -154,9 +200,18 @@ var workflowActor = func() string {
 	return os.Getenv("USER")
 }
 
-// workflowTerminal is the terminal human approvals are confirmed on.
-var workflowTerminal = func() workflow.Terminal {
-	return workflow.StdTerminal{In: os.Stdin, Out: os.Stdout}
+// workflowTerminal is the terminal human approvals are confirmed on; out is
+// where the prompt goes (stderr under --json, so stdout carries only JSON).
+var workflowTerminal = func(out io.Writer) workflow.Terminal {
+	return workflow.StdTerminal{In: os.Stdin, Out: out}
+}
+
+// promptOut is stdout normally and stderr under --json.
+func (o *wfOpts) promptOut(cmd *cobra.Command) io.Writer {
+	if o.json {
+		return cmd.ErrOrStderr()
+	}
+	return cmd.OutOrStdout()
 }
 
 // workflowRunner returns the Runner red, green and check execute through.
@@ -164,15 +219,30 @@ var workflowRunner = func(env workflow.GateEnv, itemID string) workflow.Runner {
 	return workflow.ExecRunner{OutputDir: workflow.OutputDir(env.TownRoot, env.Rig, itemID)}
 }
 
+// resolvePath resolves symlinks in p's nearest existing ancestor and
+// re-appends the rest, so existing and not-yet-existing paths compare alike.
+func resolvePath(p string) string {
+	p = filepath.Clean(p)
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	base := nearestExisting(p)
+	q, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		return p
+	}
+	rest, err := filepath.Rel(base, p)
+	if err != nil {
+		return p
+	}
+	return filepath.Join(q, rest)
+}
+
+func samePath(a, b string) bool { return resolvePath(a) == resolvePath(b) }
+
 // pathWithin reports whether p is dir or below it, after resolving symlinks.
 func pathWithin(dir, p string) bool {
-	if d, err := filepath.EvalSymlinks(dir); err == nil {
-		dir = d
-	}
-	if q, err := filepath.EvalSymlinks(p); err == nil {
-		p = q
-	}
-	rel, err := filepath.Rel(dir, p)
+	rel, err := filepath.Rel(resolvePath(dir), resolvePath(p))
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
@@ -397,6 +467,11 @@ func newItemNewCmd() *cobra.Command {
 		if err != nil {
 			return nil, err
 		}
+		// The item ID is not known yet; its dir sits directly in itemsDir.
+		itemsDir := filepath.Dir(filepath.Dir(workflow.ArtifactPath(env.TownRoot, env.Rig, "x", "x")))
+		if top, ok := gitToplevel(nearestExisting(itemsDir)); ok {
+			return nil, fmt.Errorf("artifact dir %s is inside git worktree %s; gtb keeps artifacts outside repos", itemsDir, top)
+		}
 		it, err := env.Items.Create(env.Rig, kind, title, parent)
 		if err != nil {
 			return nil, err
@@ -417,6 +492,20 @@ func newItemNewCmd() *cobra.Command {
 	})
 	c.Flags().StringVar(&parent, "parent", "", "Parent item ID")
 	return c
+}
+
+// nearestExisting returns p or its nearest existing ancestor.
+func nearestExisting(p string) string {
+	for {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return p
+		}
+		p = parent
+	}
 }
 
 // writeStub creates the first-step artifact (never overwriting a file),
@@ -576,19 +665,36 @@ Exit codes: 0 moved, 3 gate refused (reasons printed), 4 step conflict
 		if err != nil {
 			return nil, err
 		}
+		cur, err := env.Items.Get(args[0])
+		if err != nil {
+			return nil, err
+		}
+		// Only the fix gate reads git (the fix-files budget); it must diff
+		// the item's own worktree, never a shared clone.
+		var co *checkoutInfo
+		if effectiveStep(env, cur) == "fix" {
+			c, err := requireCheckout(&env)
+			if err != nil {
+				return nil, err
+			}
+			co = &c
+		}
 		it, gate, err := workflow.Advance(env, args[0], workflowActor())
 		if err != nil {
 			return nil, err
 		}
-		res := &wfResult{json: map[string]any{
-			"id": it.ID, "moved": gate.Passed, "step": it.Step, "gate": toGateJSON(gate),
-		}}
+		js := map[string]any{"id": it.ID, "moved": gate.Passed, "step": it.Step, "gate": toGateJSON(gate)}
+		res := &wfResult{json: js}
+		if co != nil {
+			js["checkout"] = *co
+			res.human = co.line()
+		}
 		if !gate.Passed {
 			res.code = wfExitRefused
-			res.human = fmt.Sprintf("%s: gate refused at %s\n", it.ID, it.Step) + refusalText(gate.Reasons, gate.WaitingForHuman)
+			res.human += fmt.Sprintf("%s: gate refused at %s\n", it.ID, it.Step) + refusalText(gate.Reasons, gate.WaitingForHuman)
 			return res, nil
 		}
-		res.human = fmt.Sprintf("%s: advanced to %s\n", it.ID, it.Step)
+		res.human += fmt.Sprintf("%s: advanced to %s\n", it.ID, it.Step)
 		return res, nil
 	})
 	return c
@@ -608,7 +714,7 @@ The artifact's sha is shown and must be confirmed.`,
 			return nil, err
 		}
 		// Refuse agents before building the environment.
-		term := workflowTerminal()
+		term := workflowTerminal(o.promptOut(cmd))
 		if err := workflow.RequireHuman(term, os.Getenv); err != nil {
 			return nil, humanGuardErr(err)
 		}
@@ -638,7 +744,7 @@ Pins check_commands_approved_sha in the rig's settings/config.json to the
 sha256 of the current check_commands. Any later edit voids the approval.`,
 		Args: cobra.NoArgs,
 	}, func(cmd *cobra.Command, _ []string, o *wfOpts) (*wfResult, error) {
-		term := workflowTerminal()
+		term := workflowTerminal(o.promptOut(cmd))
 		if err := workflow.RequireHuman(term, os.Getenv); err != nil {
 			return nil, humanGuardErr(err)
 		}
@@ -652,10 +758,7 @@ sha256 of the current check_commands. Any later edit voids the approval.`,
 			return nil, err
 		}
 		sha := workflow.CheckCommandsSHA(cmds)
-		list := cmd.OutOrStdout()
-		if o.json {
-			list = cmd.ErrOrStderr()
-		}
+		list := o.promptOut(cmd)
 		fmt.Fprintf(list, "Check commands for rig %s:\n", env.Rig)
 		for i, c := range cmds {
 			fmt.Fprintf(list, "  %d. %s\n", i+1, c)
@@ -729,9 +832,9 @@ func newVerdictCmd() *cobra.Command {
 	return c
 }
 
-// runSetup validates the item, builds the env and returns the checkout dir
-// and a timeout-bound runner. cancel must be called.
-func runSetup(cmd *cobra.Command, o *wfOpts, itemID string, timeout time.Duration) (env workflow.GateEnv, dir string, r workflow.Runner, cancel context.CancelFunc, err error) {
+// runSetup validates the item, builds the env, resolves the item's worktree
+// and returns a timeout-bound runner. cancel must be called.
+func runSetup(cmd *cobra.Command, o *wfOpts, itemID string, timeout time.Duration) (env workflow.GateEnv, co checkoutInfo, r workflow.Runner, cancel context.CancelFunc, err error) {
 	if err = workflow.ValidateID(itemID); err != nil {
 		return
 	}
@@ -745,30 +848,33 @@ func runSetup(cmd *cobra.Command, o *wfOpts, itemID string, timeout time.Duratio
 	if _, err = env.Items.Get(itemID); err != nil {
 		return
 	}
-	dir = workflowCheckoutDir(env.TownRoot, env.Rig)
+	if co, err = requireCheckout(&env); err != nil {
+		return
+	}
 	parent := cmd.Context()
 	if parent == nil {
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
-	return env, dir, ctxRunner{ctx: ctx, r: workflowRunner(env, itemID)}, cancel, nil
+	return env, co, ctxRunner{ctx: ctx, r: workflowRunner(env, itemID)}, cancel, nil
 }
 
-func tddResult(run workflow.TDDRun, err error) (*wfResult, error) {
+func tddResult(co checkoutInfo, run workflow.TDDRun, err error) (*wfResult, error) {
 	if err != nil && !errors.Is(err, workflow.ErrRefused) {
 		return nil, err
 	}
-	res := &wfResult{json: map[string]any{
+	js := map[string]any{
 		"id": run.ItemID, "plan_step": run.PlanStep, "phase": run.Phase, "exit": run.Exit,
-		"test_files": run.TestFiles, "tail": run.Tail, "refused": err != nil,
-	}}
+		"test_files": run.TestFiles, "tail": run.Tail, "refused": err != nil, "checkout": co,
+	}
+	res := &wfResult{json: js}
 	if err != nil {
 		res.code = wfExitRefused
-		res.json.(map[string]any)["reason"] = err.Error()
-		res.human = fmt.Sprintf("refused: %v\n%s\n", err, strings.TrimRight(run.Tail, "\n"))
+		js["reason"] = err.Error()
+		res.human = co.line() + fmt.Sprintf("refused: %v\n%s\n", err, strings.TrimRight(run.Tail, "\n"))
 		return res, nil
 	}
-	res.human = fmt.Sprintf("%s recorded for %s %s (exit %d)\n", run.Phase, run.ItemID, run.PlanStep, run.Exit)
+	res.human = co.line() + fmt.Sprintf("%s recorded for %s %s (exit %d)\n", run.Phase, run.ItemID, run.PlanStep, run.Exit)
 	return res, nil
 }
 
@@ -792,16 +898,17 @@ relative to the checkout, for the test files whose contents green re-checks.`,
 		if strings.TrimSpace(tests) == "" {
 			return nil, errors.New("--tests is required")
 		}
-		env, dir, r, cancel, err := runSetup(cmd, o, args[0], timeout)
+		env, co, r, cancel, err := runSetup(cmd, o, args[0], timeout)
 		if err != nil {
 			return nil, err
 		}
 		defer cancel()
-		files, err := expandTestGlobs(dir, tests)
+		files, err := expandTestGlobs(co.Dir, tests)
 		if err != nil {
 			return nil, err
 		}
-		return tddResult(workflow.Red(env, r, args[0], args[1], dir, args[2:], files))
+		run, err := workflow.Red(env, r, args[0], args[1], co.Dir, args[2:], files)
+		return tddResult(co, run, err)
 	})
 	c.Flags().StringVar(&tests, "tests", "", "Comma-separated test file globs, relative to the checkout")
 	c.Flags().DurationVar(&timeout, "timeout", wfDefaultTimeout, "Timeout for the test command")
@@ -848,12 +955,13 @@ func newGreenCmd() *cobra.Command {
 		Short: "Re-run the plan step's red command, which must now pass",
 		Args:  cobra.ExactArgs(2),
 	}, func(cmd *cobra.Command, args []string, o *wfOpts) (*wfResult, error) {
-		env, dir, r, cancel, err := runSetup(cmd, o, args[0], timeout)
+		env, co, r, cancel, err := runSetup(cmd, o, args[0], timeout)
 		if err != nil {
 			return nil, err
 		}
 		defer cancel()
-		return tddResult(workflow.Green(env, r, args[0], args[1], dir))
+		run, err := workflow.Green(env, r, args[0], args[1], co.Dir)
+		return tddResult(co, run, err)
 	})
 	c.Flags().DurationVar(&timeout, "timeout", wfDefaultTimeout, "Timeout for the test command")
 	return c
@@ -869,32 +977,32 @@ record the result. Exit 0 when every command passes, 3 when one fails or the
 commands are not approved, 1 on any other error.`,
 		Args: cobra.ExactArgs(1),
 	}, func(cmd *cobra.Command, args []string, o *wfOpts) (*wfResult, error) {
-		env, dir, r, cancel, err := runSetup(cmd, o, args[0], timeout)
+		env, co, r, cancel, err := runSetup(cmd, o, args[0], timeout)
 		if err != nil {
 			return nil, err
 		}
 		defer cancel()
-		run, err := workflow.Check(env, r, args[0], dir)
+		run, err := workflow.Check(env, r, args[0], co.Dir)
 		if errors.Is(err, workflow.ErrChecksNotApproved) {
 			return &wfResult{
 				code:  wfExitRefused,
-				human: refusalText([]string{"check commands not approved"}, "approve check commands"),
+				human: co.line() + refusalText([]string{"check commands not approved"}, "approve check commands"),
 				json: map[string]any{"id": args[0], "passed": false, "approved": false,
-					"waiting_for_human": "approve check commands"},
+					"waiting_for_human": "approve check commands", "checkout": co},
 			}, nil
 		}
 		if err != nil {
 			return nil, err
 		}
 		res := &wfResult{json: map[string]any{
-			"id": run.ItemID, "passed": run.Passed, "approved": true, "cmd_set_sha": run.CmdSetSHA, "tail": run.Tail,
+			"id": run.ItemID, "passed": run.Passed, "approved": true, "cmd_set_sha": run.CmdSetSHA, "tail": run.Tail, "checkout": co,
 		}}
 		if !run.Passed {
 			res.code = wfExitRefused
-			res.human = fmt.Sprintf("check failed for %s\n%s\n", run.ItemID, strings.TrimRight(run.Tail, "\n"))
+			res.human = co.line() + fmt.Sprintf("check failed for %s\n%s\n", run.ItemID, strings.TrimRight(run.Tail, "\n"))
 			return res, nil
 		}
-		res.human = fmt.Sprintf("checks passed for %s\n", run.ItemID)
+		res.human = co.line() + fmt.Sprintf("checks passed for %s\n", run.ItemID)
 		return res, nil
 	})
 	c.Flags().DurationVar(&timeout, "timeout", wfDefaultTimeout, "Timeout for the check commands")
