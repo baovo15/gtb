@@ -469,7 +469,9 @@ func newItemNewCmd() *cobra.Command {
 		}
 		// The item ID is not known yet; its dir sits directly in itemsDir.
 		itemsDir := filepath.Dir(filepath.Dir(workflow.ArtifactPath(env.TownRoot, env.Rig, "x", "x")))
-		if top, ok := gitToplevel(nearestExisting(itemsDir)); ok {
+		// An HQ repo at the town root is fine (HQGitignore ignores .gtb/);
+		// a rig-level repo (adopted rig root or deeper) is not.
+		if top, ok := gitToplevel(nearestExisting(itemsDir)); ok && !samePath(top, env.TownRoot) {
 			return nil, fmt.Errorf("artifact dir %s is inside git worktree %s; gtb keeps artifacts outside repos", itemsDir, top)
 		}
 		it, err := env.Items.Create(env.Rig, kind, title, parent)

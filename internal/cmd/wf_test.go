@@ -749,3 +749,36 @@ func TestItemNew_RefusesArtifactDirInsideRepo(t *testing.T) {
 		t.Errorf(".gtb created inside the repo: %v", err)
 	}
 }
+
+// TestItemNew_AllowsTownRootRepo: an HQ git repo at the town root (gt
+// install --git / gt git-init) does not block item new (R18).
+func TestItemNew_AllowsTownRootRepo(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	w := useMemWorkflowEnv(t)
+	gitInit(t, w.env.TownRoot)
+	id := newItemID(t, "task", "x")
+	if _, err := os.Stat(workflow.ArtifactPath(w.env.TownRoot, w.env.Rig, id, "spec")); err != nil {
+		t.Errorf("stub missing: %v", err)
+	}
+}
+
+func TestHQGitignore_IgnoresGtbArtifacts(t *testing.T) {
+	if !strings.Contains(HQGitignore, "\n**/.gtb/\n") {
+		t.Error("HQGitignore must ignore **/.gtb/")
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	town := t.TempDir()
+	gitInit(t, town)
+	if err := os.WriteFile(filepath.Join(town, ".gitignore"), []byte(HQGitignore), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	art := filepath.Join("r1", ".gtb", "items", "x-1", "spec.md")
+	cmd := exec.Command("git", "-C", town, "check-ignore", "-q", art)
+	if err := cmd.Run(); err != nil {
+		t.Errorf("%s not ignored by HQGitignore: %v", art, err)
+	}
+}
