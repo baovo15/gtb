@@ -1,0 +1,488 @@
+# gtb (fork of Gas Town) on k3s: namespace gtb, gtb.nhaboc.com -> NodePort 30881.
+# Derived from the live gastown namespace. IMAGE_TAG is set by scripts/gtb-deploy.sh.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gtb
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gtb-data
+  labels:
+    app: gtb
+spec:
+  accessModes:
+  - ReadWriteOnce
+  capacity:
+    storage: 50Gi
+  local:
+    path: "/var/lib/gtb"
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - beboc
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gtb-local
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gtb-dolt-data
+  labels:
+    app: gtb
+spec:
+  accessModes:
+  - ReadWriteOnce
+  capacity:
+    storage: 20Gi
+  local:
+    path: "/var/lib/gtb/dolt"
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: kubernetes.io/hostname
+          operator: In
+          values:
+          - beboc
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gtb-dolt-local
+---
+apiVersion: v1
+data:
+  config.yaml: |
+    log_level: warning
+    listener:
+      host: 0.0.0.0
+      # MUST be 3306: the image entrypoint polls 0.0.0.0:3306 before it
+      # creates root@DOLT_ROOT_HOST, and on any other port it waits forever
+      # and root never gets a password. The Service maps 3307 -> 3306, so
+      # Gas Town still sees the usual port.
+      port: 3306
+      max_connections: 1000
+      read_timeout_millis: 300000
+      write_timeout_millis: 300000
+    data_dir: /var/lib/dolt
+    behavior:
+      dolt_transaction_commit: false
+      event_scheduler: "OFF"
+      auto_gc_behavior:
+        enable: true
+        archive_level: 1
+    system_variables:
+      dolt_stats_enabled: 0
+kind: ConfigMap
+metadata:
+  annotations: {}
+  name: gtb-dolt-config
+  namespace: gtb
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations: {}
+  labels:
+    app: gtb
+  name: gtb
+  namespace: gtb
+spec:
+  ports:
+  - name: http
+    nodePort: 30881
+    port: 8080
+    targetPort: http
+  selector:
+    app: gtb
+  type: NodePort
+---
+apiVersion: v1
+kind: Service
+metadata:
+  annotations: {}
+  labels:
+    app: gtb-dolt
+  name: gtb-dolt
+  namespace: gtb
+spec:
+  ports:
+  - name: mysql
+    port: 3307
+    targetPort: mysql
+  selector:
+    app: gtb-dolt
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  annotations: {}
+  labels:
+    app: gtb
+  name: gtb
+  namespace: gtb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gtb
+  serviceName: gtb
+  template:
+    metadata:
+      labels:
+        app: gtb
+    spec:
+      containers:
+      - args:
+        - |
+          f=/home/agent/.claude.json
+          [ -s "$f" ] || echo '{}' > "$f"
+          jq '. + {hasCompletedOnboarding: true, theme: "dark", bypassPermissionsModeAccepted: true}
+              | .projects = ((.projects // {}) | . as $p
+                  | reduce ("/gt", "/gt/mayor", "/gt/deacon") as $d ($p; .[$d] = ((.[$d] // {}) + {hasTrustDialogAccepted: true})))' \
+            "$f" > "$f.new" && mv "$f.new" "$f"
+          # Claude Code keys workspace trust by GIT ROOT, so trusting /gt
+          # does not cover the separate clones under it: rig refinery /
+          # mayor clones, crew, dog worktrees, and a brand-new directory
+          # for every polecat. Untrusted, Claude shows "Quick safety
+          # check" with "No, exit" pre-selected; gt's
+          # AcceptWorkspaceTrustDialog presses Enter blind, Claude exits,
+          # and gt fails "can't find pane" / "timeout waiting for runtime
+          # prompt". So keep every git root under /gt trusted: a light
+          # loop (5s) adds any new one. Writes are jq + atomic mv, only
+          # when something is missing.
+          (
+            while :; do
+              roots=$(find /gt -maxdepth 6 -name .git -not -path '*/.dolt-data/*' 2>/dev/null \
+                      | sed 's|/\.git$||' | sort -u)
+              missing=$(for r in $roots; do
+                          jq -e --arg r "$r" '.projects[$r].hasTrustDialogAccepted == true' "$f" >/dev/null 2>&1 || echo "$r"
+                        done)
+              if [ -n "$missing" ]; then
+                jq --args '.projects = (reduce $ARGS.positional[] as $d ((.projects // {});
+                             .[$d] = ((.[$d] // {}) + {hasTrustDialogAccepted: true})))' \
+                  $missing < "$f" > "$f.trust" && mv "$f.trust" "$f"
+              fi
+              sleep 5
+            done
+          ) &
+          # GitHub auth for git and gh, from GH_TOKEN (Secret gtb-git).
+          # `gh auth setup-git` installs gh as git's credential helper for
+          # github.com, so the token is never written to ~/.git-credentials;
+          # gh reads GH_TOKEN straight from the environment.
+          [ -n "$GH_TOKEN" ] && gh auth setup-git --hostname github.com
+          # Upstream bug (gastown 649b832, internal/web/api.go): the
+          # dashboard's session preview runs plain `tmux capture-pane`
+          # with no -L, so it looked for /tmp/tmux-1000/default instead
+          # of the per-town socket gt-<sha256("/gt")[:6]> = gt-e7bf91
+          # ("Failed to capture pane: error connecting to .../default").
+          # tmux falls back to $TMUX's socket path when no -L/-S is given,
+          # so point TMUX at the town socket for the dashboard process
+          # only. (A `default -> gt-e7bf91` symlink also fixed the preview
+          # but made `gt doctor` report socket split-brain and fail.)
+          # Drop this once upstream passes -L.
+          export TMUX=/tmp/tmux-1000/gt-e7bf91,0,0
+          # Upstream's /app/docker-entrypoint.sh runs `gt install /gt
+          # --git [--force]` on EVERY start. With Dolt in its own pod
+          # (remote), install's InitRig("hq") only finds an existing DB
+          # by stat-ing /gt/.dolt-data/hq/.dolt -- not on this pod's disk
+          # any more -- so it issues CREATE DATABASE hq on the remote
+          # server, gets "database exists", and the pod crash-loops.
+          # The town and its databases already exist, so do the
+          # entrypoint's identity step ourselves and only `gt install`
+          # on a genuinely fresh volume.
+          if [ -n "$GIT_USER" ] && [ -n "$GIT_EMAIL" ]; then
+            git config --global user.name "$GIT_USER"
+            git config --global user.email "$GIT_EMAIL"
+            dolt config --global --add user.name "$GIT_USER" >/dev/null
+            dolt config --global --add user.email "$GIT_EMAIL" >/dev/null
+          fi
+          # Wait for the Dolt pod to accept SQL before anything touches
+          # it. gt decides "server running?" by a TCP dial; if Dolt isn't
+          # up yet, `gt install` takes its local-server path, tries to
+          # start a dolt sql-server in THIS pod, and fails "not accepting
+          # connections" -- leaving a half-built town. Both pods start
+          # together on a fresh rollout, so this race is real.
+          i=0
+          until echo | dolt --host "$GT_DOLT_HOST" --port "$GT_DOLT_PORT" --no-tls -u root -p "" \
+                  sql -q "select 1" >/dev/null 2>&1; do
+            i=$((i+1)); [ "$i" -ge 120 ] && { echo "Dolt at $GT_DOLT_HOST:$GT_DOLT_PORT not ready after 4m" >&2; exit 1; }
+            sleep 2
+          done
+          [ -f /gt/mayor/town.json ] || /app/gastown/gt install /gt --git
+          exec gt dashboard --port "${DASHBOARD_PORT:-8080}" --bind 0.0.0.0
+        command:
+        - tini
+        - "--"
+        - sh
+        - "-c"
+        env:
+        - name: IS_SANDBOX
+          value: '1'
+        - name: DASHBOARD_PORT
+          value: '8080'
+        - name: GT_DOLT_HOST
+          value: gtb-dolt.gtb.svc.cluster.local
+        - name: GT_DOLT_PORT
+          value: '3307'
+        - name: GT_DOLT_USER
+          value: root
+        - name: BEADS_DOLT_SERVER_HOST
+          value: gtb-dolt.gtb.svc.cluster.local
+        - name: BEADS_DOLT_SERVER_PORT
+          value: '3307'
+        - name: BEADS_DOLT_SERVER_USER
+          value: root
+        - name: GIT_USER
+          value: baovo15
+        - name: GIT_EMAIL
+          value: duybao.vn@gmail.com
+        - name: GH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: GH_TOKEN
+              name: gtb-git
+        - name: ANTHROPIC_BASE_URL
+          value: http://ninerouter.tieudidi-prod.svc.cluster.local:20128
+        - name: ANTHROPIC_MODEL
+          value: cc/claude-opus-5-5
+        - name: ANTHROPIC_SMALL_FAST_MODEL
+          value: cc/claude-haiku-4-5-20251001
+        - name: ANTHROPIC_AUTH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              key: ANTHROPIC_AUTH_TOKEN
+              name: gtb-claude-env
+        image: 127.0.0.1:30082/gtb:IMAGE_TAG
+        imagePullPolicy: IfNotPresent
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - sh
+              - "-c"
+              - cd /gt && timeout 75 gt down --all >/proc/1/fd/1 2>&1 || true
+        livenessProbe:
+          periodSeconds: 30
+          tcpSocket:
+            port: http
+        name: gtb
+        ports:
+        - containerPort: 8080
+          name: http
+        readinessProbe:
+          httpGet:
+            path: "/static/dashboard.js"
+            port: http
+          periodSeconds: 15
+          timeoutSeconds: 5
+        resources:
+          limits:
+            cpu: '8'
+            memory: 8Gi
+          requests:
+            cpu: 250m
+            memory: 512Mi
+        startupProbe:
+          failureThreshold: 30
+          periodSeconds: 10
+          tcpSocket:
+            port: http
+        volumeMounts:
+        - mountPath: "/gt"
+          name: data
+          subPath: town
+        - mountPath: "/home/agent/.claude"
+          name: data
+          subPath: claude
+        - mountPath: "/home/agent/.gt"
+          name: data
+          subPath: gt-home
+        - mountPath: "/home/agent/.local/state/gastown"
+          name: data
+          subPath: gt-state
+      securityContext:
+        runAsGroup: 1000
+        runAsUser: 1000
+      terminationGracePeriodSeconds: 90
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 50Gi
+      storageClassName: gtb-local
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  annotations: {}
+  labels:
+    app: gtb-dolt
+  name: gtb-dolt
+  namespace: gtb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gtb-dolt
+  serviceName: gtb-dolt
+  template:
+    metadata:
+      labels:
+        app: gtb-dolt
+    spec:
+      containers:
+      - env:
+        - name: DOLT_ROOT_HOST
+          value: "%"
+        image: dolthub/dolt-sql-server:2.0.7
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          tcpSocket:
+            port: mysql
+        name: dolt
+        ports:
+        - containerPort: 3306
+          name: mysql
+        readinessProbe:
+          periodSeconds: 10
+          tcpSocket:
+            port: mysql
+        resources:
+          limits:
+            cpu: '2'
+            memory: 2Gi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        volumeMounts:
+        - mountPath: "/var/lib/dolt"
+          name: data
+        - mountPath: "/etc/dolt/servercfg.d"
+          name: config
+          readOnly: true
+      terminationGracePeriodSeconds: 60
+      volumes:
+      - configMap:
+          name: gtb-dolt-config
+        name: config
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 20Gi
+      storageClassName: gtb-dolt-local
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  annotations: {}
+  name: allow-dns
+  namespace: gtb
+spec:
+  egress:
+  - ports:
+    - port: 53
+      protocol: UDP
+    - port: 53
+      protocol: TCP
+    to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+  podSelector: {}
+  policyTypes:
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  annotations: {}
+  name: default-deny
+  namespace: gtb
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  annotations: {}
+  name: allow-dolt
+  namespace: gtb
+spec:
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app: gtb
+    ports:
+    - port: 3306
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app: gtb-dolt
+  policyTypes:
+  - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  annotations: {}
+  name: allow-gtb
+  namespace: gtb
+spec:
+  egress:
+  - ports:
+    - port: 3306
+      protocol: TCP
+    to:
+    - podSelector:
+        matchLabels:
+          app: gtb-dolt
+  - ports:
+    - port: 20128
+      protocol: TCP
+    to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: tieudidi-prod
+      podSelector:
+        matchLabels:
+          app: ninerouter
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+        - 169.254.0.0/16
+        - 127.0.0.0/8
+        - 100.64.0.0/10
+  ingress:
+  - ports:
+    - port: 8080
+      protocol: TCP
+  podSelector:
+    matchLabels:
+      app: gtb
+  policyTypes:
+  - Ingress
+  - Egress
