@@ -230,3 +230,25 @@ func TestAdvance_UnknownItem(t *testing.T) {
 		t.Fatalf("err = %v, want ErrItemNotFound", err)
 	}
 }
+
+// TestAdvance_ClearsWaiting (R21): a successful transition clears the
+// item's waiting-for-human reason; a refused gate leaves it.
+func TestAdvance_ClearsWaiting(t *testing.T) {
+	env := newTestEnv(t)
+	it := newItemAt(t, env, KindTask, "spec", time.Now().Add(-time.Hour))
+	writeArtifact(t, env, it.ID, "spec", "body\n")
+	must(t, env.Items.SetWaiting(it.ID, "approve spec"))
+	if _, res, err := Advance(env, it.ID, "me"); err != nil || res.Passed {
+		t.Fatalf("unapproved advance: res=%+v err=%v", res, err)
+	}
+	if got, _ := env.Items.Get(it.ID); got.WaitingForHuman != "approve spec" {
+		t.Fatalf("refused gate cleared waiting: %q", got.WaitingForHuman)
+	}
+	approve(t, env, it.ID, "spec")
+	if _, res, err := Advance(env, it.ID, "me"); err != nil || !res.Passed {
+		t.Fatalf("approved advance: res=%+v err=%v", res, err)
+	}
+	if got, _ := env.Items.Get(it.ID); got.WaitingForHuman != "" {
+		t.Fatalf("waiting after transition = %q, want empty", got.WaitingForHuman)
+	}
+}

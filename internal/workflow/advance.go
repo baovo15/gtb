@@ -13,7 +13,8 @@ import (
 // nothing. A lost race returns the error from Store.Transition (wrapping
 // ErrStepConflict). If the transition is recorded but Items.SetStep fails,
 // the transition is kept (evidence is append-only) and the returned item
-// reflects the new step alongside the wrapped SetStep error.
+// reflects the new step alongside the wrapped SetStep error. A successful
+// transition clears the item's waiting-for-human reason.
 func Advance(env GateEnv, itemID, actor string) (*Item, GateResult, error) {
 	it, err := env.Items.Get(itemID)
 	if err != nil {
@@ -57,6 +58,11 @@ func Advance(env GateEnv, itemID, actor string) (*Item, GateResult, error) {
 	it.Step, it.StepEnteredAt = next, tr.At
 	if err := env.Items.SetStep(itemID, next, tr.At); err != nil {
 		return it, res, fmt.Errorf("workflow: transition %s %s->%s recorded but set step failed: %w", itemID, cur, next, err)
+	}
+	// The step the item waited at is behind it: clear any human wait (R21).
+	it.WaitingForHuman = ""
+	if err := env.Items.SetWaiting(itemID, ""); err != nil {
+		return it, res, fmt.Errorf("workflow: transition %s %s->%s recorded but clearing waiting failed: %w", itemID, cur, next, err)
 	}
 	return it, res, nil
 }

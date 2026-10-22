@@ -994,8 +994,8 @@ var gtbStepFormulas = []string{
 }
 
 // TestEmbeddedFormulas_IncludeGtbSteps: every gtb step formula is embedded,
-// parses, names itself, runs gtb advance and gtb done, and never tells the
-// agent to run gtb approve.
+// parses, names itself, runs gtb advance and plain gtb done (also at a human
+// wait, R22), and never tells the agent to run gtb approve.
 func TestEmbeddedFormulas_IncludeGtbSteps(t *testing.T) {
 	if len(gtbStepFormulas) != 13 {
 		t.Fatalf("want 13 gtb step formulas, have %d", len(gtbStepFormulas))
@@ -1015,13 +1015,17 @@ func TestEmbeddedFormulas_IncludeGtbSteps(t *testing.T) {
 			t.Errorf("%s: formula=%q version=%d steps=%d", name, f.Name, f.Version, len(f.Steps))
 		}
 		text := string(data)
-		for _, want := range []string{"gtb item show {{issue}} --json", "gtb advance {{issue}}", "gtb done --status DEFERRED", "a human approves this; you do not"} {
+		for _, want := range []string{"gtb item show {{issue}} --json", "gtb advance {{issue}}", "gtb done\n", "waiting for:", "a human approves this; you do not"} {
 			if !strings.Contains(text, want) {
 				t.Errorf("%s: missing %q", name, want)
 			}
 		}
 		if strings.Contains(text, "gtb approve ") || strings.Contains(text, "gt approve") {
 			t.Errorf("%s: must not tell the agent to run gtb approve", name)
+		}
+		// R22: a human wait ends with plain gtb done (self-clean), never DEFERRED.
+		if strings.Contains(text, "--status DEFERRED") {
+			t.Errorf("%s: must use plain gtb done at a human wait, not --status DEFERRED", name)
 		}
 	}
 	review, _ := GetEmbeddedFormulaContent("gtb-task-review")

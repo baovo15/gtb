@@ -72,16 +72,16 @@ id = "done"
 title = "Leave through gtb done"
 needs = ["advance"]
 description = """
-If `gtb advance` exited 3 with a `waiting for:` line:
-```bash
-gtb done --status DEFERRED
-```
-Otherwise (it exited 0):
+Commit your work, then, whether `gtb advance` exited 0 or exited 3 with a
+`waiting for:` line:
 ```bash
 gtb done
 ```
-Commit your work first. gtb done submits a merge request only at the merge
-step; at every other step it records any human wait and cleans up."""
+gtb done submits a merge request only at the merge step. At every other step
+it records any human wait, releases the item for its next step and retires
+this session; the next step is slung to a fresh polecat on the same branch.
+If advance exited 3 without a `waiting for:` line and you cannot fix the
+reasons, run `gtb done --status ESCALATED` instead."""
 
 [vars]
 [vars.issue]

@@ -232,7 +232,13 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		}
 	}
 
-	// 3. Spawn polecat (via spawnPolecatForSling)
+	// 3. Spawn polecat (via spawnPolecatForSling). A gated item already bound
+	// to a branch resumes it (R20).
+	resumeBranch, err := gatedResumeBranch(townRoot, params.RigName, params.BeadID, params.ResumeBranch)
+	if err != nil {
+		result.ErrMsg = err.Error()
+		return result, err
+	}
 	spawnOpts := SlingSpawnOptions{
 		TownRoot:     townRoot,
 		Force:        params.Force,
@@ -240,7 +246,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		HookBead:     params.BeadID,
 		Agent:        params.Agent,
 		BaseBranch:   params.BaseBranch,
-		ResumeBranch: params.ResumeBranch,
+		ResumeBranch: resumeBranch,
 		// Create is always true for rig targets: executeSling only handles
 		// rig-targeted dispatch (batch sling + queue dispatch), where a fresh
 		// polecat must be spawned. The single-sling path (runSling) handles

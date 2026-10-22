@@ -252,3 +252,120 @@ func TestBindGatedItemBranch(t *testing.T) {
 		t.Errorf("disabled rig updated:\n%s", raw)
 	}
 }
+
+// gatedRigWithRepo is gatedRig plus a mayor/rig git repo holding branch.
+func gatedRigWithRepo(t *testing.T, branch string) (townRoot, rigName string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	townRoot, rigName = gatedRig(t, true)
+	repo := filepath.Join(townRoot, rigName, "mayor", "rig")
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main", repo},
+		{"-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"},
+		{"-C", repo, "branch", branch},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	return townRoot, rigName
+}
+
+// TestGatedResumeBranch (R20): a gated item bound to an existing branch
+// resumes it; a missing bound branch is refused, never recreated.
+func TestGatedResumeBranch(t *testing.T) {
+	townRoot, rigName := gatedRigWithRepo(t, "polecat/p1/gt-abc")
+	installLabelsBD(t, "gt-abc", `"gtb:wf:task","gtb:step:execute","gtb:branch:polecat/p1/gt-abc"`)
+	got, err := gatedResumeBranch(townRoot, rigName, "gt-abc", "")
+	if err != nil || got != "polecat/p1/gt-abc" {
+		t.Fatalf("bound branch: got %q, %v", got, err)
+	}
+
+	installLabelsBD(t, "gt-abc", `"gtb:wf:task","gtb:step:execute","gtb:branch:polecat/gone"`)
+	if _, err := gatedResumeBranch(townRoot, rigName, "gt-abc", ""); err == nil || err.Error() != "item gt-abc branch polecat/gone is missing" {
+		t.Fatalf("missing branch: err = %v", err)
+	}
+
+	// First sling (no binding yet) and non-workflow beads keep the caller's value.
+	installLabelsBD(t, "gt-abc", `"gtb:wf:task","gtb:step:spec"`)
+	if got, err := gatedResumeBranch(townRoot, rigName, "gt-abc", ""); err != nil || got != "" {
+		t.Fatalf("unbound: got %q, %v", got, err)
+	}
+	installLabelsBD(t, "gt-abc", `"gt:task"`)
+	if got, err := gatedResumeBranch(townRoot, rigName, "gt-abc", "feature/x"); err != nil || got != "feature/x" {
+		t.Fatalf("non-workflow: got %q, %v", got, err)
+	}
+}
+
+// TestResolveTargetGatedItemResumesBranch (R20): the rig-target spawn path
+// passes the item's bound branch as ResumeBranch, and refuses (without
+// spawning) when that branch is missing.
+func TestResolveTargetGatedItemResumesBranch(t *testing.T) {
+	townRoot := setupPolecatCapacityRig(t, 1)
+	settings := config.NewRigSettings()
+	settings.Workflow = &config.WorkflowConfig{Gated: &config.GatedWorkflow{Enabled: true}}
+	if err := config.SaveRigSettings(config.RigSettingsPath(filepath.Join(townRoot, "gastown")), settings); err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(townRoot, "gastown", "mayor", "rig")
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main", repo},
+		{"-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init"},
+		{"-C", repo, "branch", "polecat/toast/gt-abc"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	oldSpawn := spawnPolecatForSling
+	t.Cleanup(func() { spawnPolecatForSling = oldSpawn })
+	var gotResume []string
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		gotResume = append(gotResume, opts.ResumeBranch)
+		return &SpawnedPolecatInfo{RigName: "gastown", PolecatName: "toast", Branch: opts.ResumeBranch,
+			ClonePath: filepath.Join(townRoot, "gastown", "polecats", "toast", "gastown")}, nil
+	}
+	opts := ResolveTargetOptions{TownRoot: townRoot, HookBead: "gt-abc", SkipPolecatAdmission: true, NoBoot: true}
+
+	installLabelsBD(t, "gt-abc", `"gtb:wf:task","gtb:step:verify","gtb:branch:polecat/toast/gt-abc"`)
+	if _, err := resolveTarget("gastown", opts); err != nil {
+		t.Fatalf("resolveTarget: %v", err)
+	}
+	if len(gotResume) != 1 || gotResume[0] != "polecat/toast/gt-abc" {
+		t.Fatalf("ResumeBranch = %v, want [polecat/toast/gt-abc]", gotResume)
+	}
+
+	installLabelsBD(t, "gt-abc", `"gtb:wf:task","gtb:step:verify","gtb:branch:polecat/gone"`)
+	if _, err := resolveTarget("gastown", opts); err == nil || !strings.Contains(err.Error(), "item gt-abc branch polecat/gone is missing") {
+		t.Fatalf("missing branch: err = %v", err)
+	}
+	if len(gotResume) != 1 {
+		t.Fatalf("spawned despite a missing branch: %v", gotResume)
+	}
+}
+
+// TestBatchFormulas_PerBead (R23): batch sling resolves each bead's formula
+// with its own ID, so a gated item gets its step formula and a plain bead
+// keeps the default; each distinct formula is listed once for cooking.
+func TestBatchFormulas_PerBead(t *testing.T) {
+	townRoot, rigName := gatedRig(t, true)
+	installLabelsBD(t, "gt-abc", `"gtb:wf:fix","gtb:step:rca"`)
+	oldF, oldRaw := slingFormula, slingHookRawBead
+	slingFormula, slingHookRawBead = "", false
+	t.Cleanup(func() { slingFormula, slingHookRawBead = oldF, oldRaw })
+
+	formulaFor, order := batchFormulas([]string{"gt-abc", "gt-plain", "gt-plain2"}, townRoot, rigName)
+	if formulaFor["gt-abc"] != "gtb-fix-rca" || formulaFor["gt-plain"] != "mol-polecat-work" || formulaFor["gt-plain2"] != "mol-polecat-work" {
+		t.Errorf("formulaFor = %v", formulaFor)
+	}
+	if strings.Join(order, ",") != "gtb-fix-rca,mol-polecat-work" {
+		t.Errorf("cook order = %v", order)
+	}
+
+	slingFormula = "mol-x" // explicit --formula still wins for every bead
+	if formulaFor, _ := batchFormulas([]string{"gt-abc"}, townRoot, rigName); formulaFor["gt-abc"] != "mol-x" {
+		t.Errorf("explicit formula: %v", formulaFor)
+	}
+}

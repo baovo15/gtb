@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/formula"
+	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
 	"github.com/steveyegge/gastown/internal/style"
@@ -349,6 +352,65 @@ func gatedStepFormula(townRoot, rigName, itemID string) string {
 		return ""
 	}
 	return name
+}
+
+// gatedResumeBranch returns the branch a polecat spawned for beadID must
+// resume (R20: a gated item keeps one branch for its whole life). For a gated
+// workflow item already bound to a branch (Item.Branch, recorded by
+// bindGatedItemBranch) it returns that branch, after checking it still
+// exists in the rig's repo base (.repo.git or mayor/rig, local or
+// origin/<branch>) or on origin; a missing branch is an error, never a fresh
+// branch. Otherwise it returns resume unchanged (the first sling creates the
+// branch). A bead that is not a workflow item, or a rig that is not gated,
+// is unaffected; any other lookup error is returned.
+func gatedResumeBranch(townRoot, rigName, beadID, resume string) (string, error) {
+	if townRoot == "" || rigName == "" || beadID == "" {
+		return resume, nil
+	}
+	rigPath := filepath.Join(townRoot, rigName)
+	cfg, err := workflow.LoadConfig(rigPath)
+	if err != nil || !cfg.Enabled {
+		return resume, nil
+	}
+	it, err := workflow.NewBeadsItems(beads.New(rigPath)).Get(beadID)
+	if errors.Is(err, workflow.ErrItemNotFound) {
+		return resume, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("gated item %s: %w", beadID, err)
+	}
+	if it.Branch == "" {
+		return resume, nil
+	}
+	if resume != "" && resume != it.Branch {
+		return "", fmt.Errorf("item %s is bound to branch %s; --branch %s conflicts", beadID, it.Branch, resume)
+	}
+	if !gatedBranchExists(rigPath, it.Branch) {
+		return "", fmt.Errorf("item %s branch %s is missing", beadID, it.Branch)
+	}
+	fmt.Printf("%s Gated item %s resumes branch %s\n", style.Bold.Render("→"), beadID, it.Branch)
+	return it.Branch, nil
+}
+
+// gatedBranchExists reports whether branch exists in the rig's repo base
+// (the bare .repo.git, else mayor/rig) as a local or origin tracking ref, or
+// on origin itself.
+func gatedBranchExists(rigPath, branch string) bool {
+	var g *git.Git
+	if fi, err := os.Stat(filepath.Join(rigPath, ".repo.git")); err == nil && fi.IsDir() {
+		g = git.NewGitWithDir(filepath.Join(rigPath, ".repo.git"), "")
+	} else if fi, err := os.Stat(filepath.Join(rigPath, "mayor", "rig")); err == nil && fi.IsDir() {
+		g = git.NewGit(filepath.Join(rigPath, "mayor", "rig"))
+	} else {
+		return false
+	}
+	for _, ref := range []string{"refs/heads/" + branch, "refs/remotes/origin/" + branch} {
+		if ok, err := g.RefExists(ref); err == nil && ok {
+			return true
+		}
+	}
+	ok, err := g.RemoteBranchExists("origin", branch)
+	return err == nil && ok
 }
 
 // bindGatedItemBranch records gtb:branch:<branch> on a gated workflow item
