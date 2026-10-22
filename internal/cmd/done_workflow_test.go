@@ -13,6 +13,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/workflow"
 )
 
@@ -176,8 +177,86 @@ func TestDone_GatedHoldReleasesItem(t *testing.T) {
 	if got, _ := env.Items.Get(it.ID); got.WaitingForHuman != "approve spec" {
 		t.Errorf("waiting = %q, want approve spec", got.WaitingForHuman)
 	}
-	if !shouldRetireGatedHold(ExitCompleted, false) || killer.calls != 1 {
-		t.Errorf("retire decision false or session not retired (calls=%d)", killer.calls)
+	wantSession := session.PolecatSessionName(session.PrefixFor("gastown"), "refuge")
+	if killer.calls != 1 || killer.name != wantSession {
+		t.Errorf("session retirements = %d (%q), want 1 (%q)", killer.calls, killer.name, wantSession)
+	}
+}
+
+// assertItemKept checks the bd log shows the gated item neither released nor
+// closed: it stays hooked and assigned to the preserved session (R26).
+func assertItemKept(t *testing.T, log, id string) {
+	t.Helper()
+	if strings.Contains(log, "update "+id+" --status=open --assignee=") {
+		t.Errorf("item released although the session is kept:\n%s", log)
+	}
+	if strings.Contains(log, "\tclose "+id) || strings.Contains(log, "gt:merge-request") {
+		t.Errorf("item closed or MR created:\n%s", log)
+	}
+}
+
+// TestDone_GatedHoldEscalatedKeepsItem (R26): an ESCALATED gated hold keeps
+// the session and leaves the item hooked and assigned to it.
+func TestDone_GatedHoldEscalatedKeepsItem(t *testing.T) {
+	env, bdLog := setupGatedDoneTown(t)
+	it, err := env.Items.Create("gastown", workflow.KindTask, "x", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDraftSpec(t, env, it.ID)
+	killer := fakeRetireKiller(t)
+	doneIssue = it.ID
+	doneStatus = ExitEscalated
+	updateAgentStateOnDoneFn = updateAgentStateOnDone
+
+	if err := runDone(nil, nil); err != nil {
+		t.Fatalf("runDone: %v", err)
+	}
+	assertItemKept(t, readSubmitSourceBDLog(t, bdLog), it.ID)
+	if killer.calls != 0 {
+		t.Errorf("session retired on ESCALATED (calls=%d)", killer.calls)
+	}
+}
+
+// TestDone_GatedHoldPushFailedKeepsItem (R26): when the gated push fails the
+// session is preserved and the item stays hooked and assigned to it.
+func TestDone_GatedHoldPushFailedKeepsItem(t *testing.T) {
+	env, bdLog := setupGatedDoneTown(t)
+	it, err := env.Items.Create("gastown", workflow.KindTask, "x", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeDraftSpec(t, env, it.ID)
+	cwd, _ := os.Getwd()
+	runGitForMQSubmitTest(t, cwd, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "missing.git"))
+	killer := fakeRetireKiller(t)
+	doneIssue = it.ID
+	updateAgentStateOnDoneFn = updateAgentStateOnDone
+
+	if err := runDone(nil, nil); err != nil {
+		t.Fatalf("runDone: %v", err)
+	}
+	assertItemKept(t, readSubmitSourceBDLog(t, bdLog), it.ID)
+	if killer.calls != 0 {
+		t.Errorf("session retired after a failed push (calls=%d)", killer.calls)
+	}
+}
+
+// TestUpdateAgentStateOnDone_GatedHoldNoRelease (R26): when the hold does
+// not retire the session, the agent-state update leaves the item alone.
+func TestUpdateAgentStateOnDone_GatedHoldNoRelease(t *testing.T) {
+	env, bdLog := setupGatedDoneTown(t)
+	cwd, _ := os.Getwd()
+	doneHoldGatedItem, doneReleaseGatedItem = true, false
+	t.Cleanup(func() { doneHoldGatedItem, doneReleaseGatedItem = false, false })
+
+	if err := updateAgentStateOnDone(cwd, env.TownRoot, ExitEscalated, "gt-item"); err != nil {
+		t.Fatalf("updateAgentStateOnDone: %v", err)
+	}
+	log := readSubmitSourceBDLog(t, bdLog)
+	assertItemKept(t, log, "gt-item")
+	if strings.Contains(log, "close gt-wisp-1") {
+		t.Errorf("step molecule closed although the session is kept:\n%s", log)
 	}
 }
 
@@ -252,8 +331,8 @@ func TestDone_GatedLookupErrorFailsClosed(t *testing.T) {
 func TestUpdateAgentStateOnDone_GatedHold(t *testing.T) {
 	env, bdLog := setupGatedDoneTown(t)
 	cwd, _ := os.Getwd()
-	doneHoldGatedItem = true
-	t.Cleanup(func() { doneHoldGatedItem = false })
+	doneHoldGatedItem, doneReleaseGatedItem = true, true
+	t.Cleanup(func() { doneHoldGatedItem, doneReleaseGatedItem = false, false })
 
 	if err := updateAgentStateOnDone(cwd, env.TownRoot, ExitCompleted, "gt-item"); err != nil {
 		t.Fatalf("updateAgentStateOnDone: %v", err)

@@ -38,12 +38,27 @@ type Items interface {
 	List(rig string) ([]*Item, error)
 }
 
+// LabelWaitingPrefix prefixes the bead label recording that an item waits on
+// a human ("gtb:waiting:<reason>"). Dispatchers (convoy stranded scan and
+// feeder) use it to leave waiting items alone.
+const LabelWaitingPrefix = "gtb:waiting:"
+
+// HasWaitingLabel reports whether labels include a gtb:waiting: label.
+func HasWaitingLabel(labels []string) bool {
+	for _, l := range labels {
+		if strings.HasPrefix(l, LabelWaitingPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // Bead label prefixes holding item state.
 const (
 	labelKind    = "gtb:wf:"
 	labelStep    = "gtb:step:"
 	labelEntered = "gtb:entered:"
-	labelWaiting = "gtb:waiting:"
+	labelWaiting = LabelWaitingPrefix
 	labelRig     = "gtb:rig:"
 	labelBranch  = "gtb:branch:"
 )

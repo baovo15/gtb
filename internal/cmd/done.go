@@ -963,7 +963,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		return err
 	}
 	doneHoldGatedItem = gatedHold
-	defer func() { doneHoldGatedItem = false }()
+	defer func() { doneHoldGatedItem, doneReleaseGatedItem = false, false }()
 
 	if gatedHold {
 		fmt.Printf("%s Gated item %s is not at merge: no merge request submitted\n", style.Bold.Render("→"), issueID)
@@ -1950,6 +1950,10 @@ notifyWitness:
 		style.PrintWarning("could not log feed event: %v", err)
 	}
 
+	// A gated hold releases the item only when the session retires (R26);
+	// otherwise the item stays hooked and assigned to the preserved session.
+	doneReleaseGatedItem = gatedHold && shouldRetireGatedHold(exitType, pushFailed)
+
 	// Update agent bead state (ZFC: self-report completion). If push/MR failed,
 	// keep the hook intact so Witness can recover the still-open work.
 	if err := updateAgentStateAfterSubmission(cwd, townRoot, exitType, issueID, pushFailed, mrFailed); err != nil {
@@ -2132,6 +2136,12 @@ func verifyPushedCommitWithBareFallback(g *git.Git, townRoot, rigName, branch, c
 // its merge step: updateAgentStateOnDone then releases the item
 // (releaseGatedItem) instead of closing it.
 var doneHoldGatedItem bool
+
+// doneReleaseGatedItem is set alongside doneHoldGatedItem when the hold also
+// retires the polecat session (shouldRetireGatedHold). Only then is the item
+// released for its next step; otherwise it stays hooked and assigned to the
+// preserved session (R26).
+var doneReleaseGatedItem bool
 
 // doneGatedHold reports whether issueID is a gated workflow item (rig has
 // workflow.gated.enabled and the bead carries gtb:wf:<kind>) whose effective
@@ -2434,13 +2444,17 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
 	isWorkflowStep := strings.Contains(hookedBeadID, "-wfs-")
 
 	if hookedBeadID != "" && doneHoldGatedItem {
-		// Gated item before merge: close only the step's molecule and leave
-		// the item open and unassigned for its next step.
-		hookBd, _, _ := routedIssueBeads(beadsPath, hookedBeadID)
-		if hookBd == nil {
-			hookBd = bd
+		// Gated item before merge: never closed here. When the session
+		// retires, close the step's molecule and release the item (open,
+		// unassigned) for its next step; otherwise leave it hooked and
+		// assigned to the preserved session (R26).
+		if doneReleaseGatedItem {
+			hookBd, _, _ := routedIssueBeads(beadsPath, hookedBeadID)
+			if hookBd == nil {
+				hookBd = bd
+			}
+			releaseGatedItem(hookBd, hookedBeadID)
 		}
-		releaseGatedItem(hookBd, hookedBeadID)
 	} else if hookedBeadID != "" && (exitType != ExitDeferred || isWorkflowStep) {
 		// BUG FIX (gt-pftz): Close hooked bead unless already terminal (closed/tombstone).
 		// Previously checked hookedBead.Status == StatusHooked, but polecats update
