@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -88,7 +89,7 @@ func TestDoltStore_RoundTrip(t *testing.T) {
 	if err := s.AddApproval(a); err != nil {
 		t.Fatal(err)
 	}
-	r := TDDRun{ItemID: "it-1", PlanStep: "1", Phase: "red", Cmd: "go test", Exit: 1, TestFilesSHA: "t", Tail: "FAIL", Source: "cli", Provenance: "p", At: at}
+	r := TDDRun{ItemID: "it-1", PlanStep: "1", Phase: "red", Cmd: "go test", Exit: 1, TestFilesSHA: "t", TestFiles: []string{"a_test.go", "b/c_test.go"}, Tail: "FAIL", Source: "cli", Provenance: "p", At: at}
 	if err := s.AddTDD(r); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +102,7 @@ func TestDoltStore_RoundTrip(t *testing.T) {
 		t.Fatalf("approvals = %+v, %v", as, err)
 	}
 	rs, err := s.TDD("it-1")
-	if err != nil || len(rs) != 1 || rs[0] != r {
+	if err != nil || len(rs) != 1 || !reflect.DeepEqual(rs[0], r) {
 		t.Fatalf("tdd = %+v, %v", rs, err)
 	}
 	cs, err := s.Checks("it-1")

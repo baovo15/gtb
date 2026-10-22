@@ -50,3 +50,9 @@ func ArtifactFor(k Kind, s Step) string {
 func ArtifactPath(townRoot, rig, itemID, name string) string {
 	return filepath.Join(townRoot, rig, ".gtb", "items", itemID, name+".md")
 }
+
+// OutputDir returns the directory verified-run logs for item itemID are
+// written to: <townRoot>/<rig>/.gtb/items/<itemID>/outputs.
+func OutputDir(townRoot, rig, itemID string) string {
+	return filepath.Join(townRoot, rig, ".gtb", "items", itemID, "outputs")
+}

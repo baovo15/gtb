@@ -27,6 +27,8 @@ type Observer interface {
 }
 
 // GateEnv is everything a gate needs to evaluate an item. Observer may be nil.
+// Now is the clock gtb stamps evidence with (Red, Green, Check, HumanApprove,
+// RecordVerdict); nil means time.Now. Callers never supply timestamps.
 type GateEnv struct {
 	TownRoot, Rig string
 	Store         Store
@@ -34,6 +36,15 @@ type GateEnv struct {
 	Config        *config.GatedWorkflow
 	Git           ChangedFiles
 	Observer      Observer
+	Now           func() time.Time
+}
+
+// now returns env.Now() (or time.Now) in UTC.
+func (env GateEnv) now() time.Time {
+	if env.Now != nil {
+		return env.Now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 // GateResult is the outcome of evaluating an item's current step gate.

@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -25,10 +26,14 @@ type Approval struct {
 }
 
 // TDDRun records one red/green (or refused) test run for a plan step.
+// Cmd is the argv as a JSON array string (never a shell string). TestFiles
+// are the test file paths (relative to the run directory) whose contents
+// TestFilesSHA covers.
 type TDDRun struct {
 	ItemID, PlanStep, Phase, Cmd           string
 	Exit                                   int
 	TestFilesSHA, Tail, Source, Provenance string
+	TestFiles                              []string
 	At                                     time.Time
 }
 
@@ -113,6 +118,7 @@ func (m *memStore) AddTDD(r TDDRun) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r.At = utc(r.At)
+	r.TestFiles = append([]string(nil), r.TestFiles...)
 	m.tdd = append(m.tdd, r)
 	return nil
 }
@@ -120,7 +126,11 @@ func (m *memStore) AddTDD(r TDDRun) error {
 func (m *memStore) TDD(id string) ([]TDDRun, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return filter(m.tdd, func(r TDDRun) bool { return r.ItemID == id }), nil
+	out := filter(m.tdd, func(r TDDRun) bool { return r.ItemID == id })
+	for i := range out {
+		out[i].TestFiles = append([]string(nil), out[i].TestFiles...)
+	}
+	return out, nil
 }
 
 func (m *memStore) AddCheck(c CheckRun) error {
@@ -184,6 +194,7 @@ var doltSchema = []string{
 		cmd TEXT NOT NULL,
 		exit_code INT NOT NULL,
 		test_files_sha VARCHAR(128) NOT NULL,
+		test_files TEXT NOT NULL,
 		tail TEXT NOT NULL,
 		source VARCHAR(255) NOT NULL,
 		provenance TEXT NOT NULL,
@@ -252,14 +263,18 @@ func (d *doltStore) Approvals(id string) ([]Approval, error) {
 }
 
 func (d *doltStore) AddTDD(r TDDRun) error {
-	_, err := d.db.Exec(`INSERT INTO gtb_tdd (item_id, plan_step, phase, cmd, exit_code, test_files_sha, tail, source, provenance, at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ItemID, r.PlanStep, r.Phase, r.Cmd, r.Exit, r.TestFilesSHA, r.Tail, r.Source, r.Provenance, utc(r.At))
+	files, err := json.Marshal(r.TestFiles)
+	if err != nil {
+		return wrap("encode tdd test files", err)
+	}
+	_, err = d.db.Exec(`INSERT INTO gtb_tdd (item_id, plan_step, phase, cmd, exit_code, test_files_sha, test_files, tail, source, provenance, at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ItemID, r.PlanStep, r.Phase, r.Cmd, r.Exit, r.TestFilesSHA, string(files), r.Tail, r.Source, r.Provenance, utc(r.At))
 	return wrap("add tdd run", err)
 }
 
 func (d *doltStore) TDD(id string) ([]TDDRun, error) {
-	rows, err := d.db.Query(`SELECT item_id, plan_step, phase, cmd, exit_code, test_files_sha, tail, source, provenance, at
+	rows, err := d.db.Query(`SELECT item_id, plan_step, phase, cmd, exit_code, test_files_sha, test_files, tail, source, provenance, at
 		FROM gtb_tdd WHERE item_id = ? ORDER BY id`, id)
 	if err != nil {
 		return nil, wrap("list tdd runs", err)
@@ -268,8 +283,12 @@ func (d *doltStore) TDD(id string) ([]TDDRun, error) {
 	var out []TDDRun
 	for rows.Next() {
 		var r TDDRun
-		if err := rows.Scan(&r.ItemID, &r.PlanStep, &r.Phase, &r.Cmd, &r.Exit, &r.TestFilesSHA, &r.Tail, &r.Source, &r.Provenance, &r.At); err != nil {
+		var files string
+		if err := rows.Scan(&r.ItemID, &r.PlanStep, &r.Phase, &r.Cmd, &r.Exit, &r.TestFilesSHA, &files, &r.Tail, &r.Source, &r.Provenance, &r.At); err != nil {
 			return nil, wrap("scan tdd run", err)
+		}
+		if err := json.Unmarshal([]byte(files), &r.TestFiles); err != nil {
+			return nil, wrap("decode tdd test files", err)
 		}
 		r.At = r.At.UTC()
 		out = append(out, r)
