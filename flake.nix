@@ -37,6 +37,11 @@
 
             subPackages = [ "cmd/gtb" ];
 
+            # The code shells out to `gt` by name; provide it alongside `gtb`.
+            postInstall = ''
+              ln -s gtb $out/bin/gt
+            '';
+
             meta = with pkgs.lib; {
               description = "Multi-agent orchestration system for Claude Code with persistent work tracking";
               homepage = "https://github.com/gastownhall/gastown";

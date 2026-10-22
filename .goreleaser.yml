@@ -89,11 +89,6 @@ release:
     brew install gastown
     ```
 
-    **npm (Node.js):**
-    ```bash
-    npm install -g @gastown/gt
-    ```
-
     **Manual Install:**
     Download the appropriate binary for your platform below, extract it, and place it in your PATH.
 
