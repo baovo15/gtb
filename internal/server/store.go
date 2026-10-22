@@ -29,6 +29,14 @@ var ErrUnknownRequestType = errors.New("server: unknown request type")
 // at or before now.
 var ErrInvalidExpiry = errors.New("server: invalid request expiry")
 
+// ErrInvalidEvent is returned by AppendEvents for an event with an empty ID,
+// an unknown type or undecodable data.
+var ErrInvalidEvent = errors.New("server: invalid event")
+
+// ErrCursorMismatch is returned by AppendEventsAfter when the caller's after
+// cursor is not the machine's stored cursor.
+var ErrCursorMismatch = errors.New("server: cursor mismatch")
+
 // Request statuses.
 const (
 	RequestPending   = "pending"
@@ -37,12 +45,13 @@ const (
 	RequestExpired   = "expired"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 // Store is the server's SQLite database. All writes go through a single
 // connection, so they are serialized.
 type Store struct {
-	db *sql.DB
+	db       *sql.DB
+	notifier *requestNotifier
 }
 
 // Machine is a row of the machines table.
@@ -57,6 +66,9 @@ type Machine struct {
 	LastSeenAt time.Time
 	Cursor     string
 	RevokedAt  *time.Time
+	// HasSnapshot is true once the server has applied a snapshot from the
+	// machine. Until then the machine must resync.
+	HasSnapshot bool
 }
 
 // ItemFilter selects items for Items. Empty fields match everything.
@@ -86,7 +98,8 @@ CREATE TABLE IF NOT EXISTS machines (
 	created_at   INTEGER NOT NULL,
 	last_seen_at INTEGER NOT NULL,
 	cursor       TEXT NOT NULL DEFAULT '',
-	revoked_at   INTEGER
+	revoked_at   INTEGER,
+	has_snapshot INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS tokens (
 	sha        TEXT PRIMARY KEY,
@@ -198,7 +211,7 @@ func OpenStore(path string) (*Store, error) {
 		return nil, fmt.Errorf("server: open store: %w", err)
 	}
 	db.SetMaxOpenConns(1) // serialize all access, writes included
-	s := &Store{db: db}
+	s := &Store{db: db, notifier: newRequestNotifier()}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -220,7 +233,24 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("server: read schema version: %w", err)
 	}
 	if n == 0 {
+		// Fresh database: the schema above is already current.
 		if _, err := tx.Exec(`INSERT INTO schema_version(version) VALUES (?)`, schemaVersion); err != nil {
+			return fmt.Errorf("server: write schema version: %w", err)
+		}
+		return tx.Commit()
+	}
+	var v int
+	if err := tx.QueryRow(`SELECT max(version) FROM schema_version`).Scan(&v); err != nil {
+		return fmt.Errorf("server: read schema version: %w", err)
+	}
+	if v < 2 {
+		// v2: machines.has_snapshot.
+		if _, err := tx.Exec(`ALTER TABLE machines ADD COLUMN has_snapshot INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("server: migrate to v2: %w", err)
+		}
+	}
+	if v < schemaVersion {
+		if _, err := tx.Exec(`UPDATE schema_version SET version = ?`, schemaVersion); err != nil {
 			return fmt.Errorf("server: write schema version: %w", err)
 		}
 	}
@@ -303,13 +333,13 @@ func (s *Store) RevokeMachine(id string) error {
 	return tx.Commit()
 }
 
-const machineCols = `m.id, m.hostname, m.os, m.arch, m.gtb_version, m.protocol, m.created_at, m.last_seen_at, m.cursor, m.revoked_at`
+const machineCols = `m.id, m.hostname, m.os, m.arch, m.gtb_version, m.protocol, m.created_at, m.last_seen_at, m.cursor, m.revoked_at, m.has_snapshot`
 
 func scanMachine(row interface{ Scan(...any) error }) (*Machine, error) {
 	var m Machine
 	var created, seen int64
 	var revoked sql.NullInt64
-	if err := row.Scan(&m.ID, &m.Hostname, &m.OS, &m.Arch, &m.GtbVersion, &m.Protocol, &created, &seen, &m.Cursor, &revoked); err != nil {
+	if err := row.Scan(&m.ID, &m.Hostname, &m.OS, &m.Arch, &m.GtbVersion, &m.Protocol, &created, &seen, &m.Cursor, &revoked, &m.HasSnapshot); err != nil {
 		return nil, err
 	}
 	m.CreatedAt, m.LastSeenAt, m.RevokedAt = fromMS(created), fromMS(seen), nullMS(revoked)
@@ -329,6 +359,18 @@ func (s *Store) MachineByToken(tokenSHA string) (*Machine, error) {
 		return nil, fmt.Errorf("server: machine by token: %w", err)
 	}
 	return m, nil
+}
+
+// TouchMachine sets the machine's last_seen_at to now.
+func (s *Store) TouchMachine(id string, now time.Time) error {
+	res, err := s.db.Exec(`UPDATE machines SET last_seen_at = ? WHERE id = ?`, ms(now), id)
+	if err != nil {
+		return fmt.Errorf("server: touch machine: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // Machine returns a machine by id, revoked or not.
@@ -401,7 +443,8 @@ func upsertSession(tx execer, machineID string, sv agentlink.SessionView, now in
 }
 
 // ApplySnapshot replaces the machine's rigs, items, artifacts and sessions
-// with s, and sets the machine's cursor to s.Cursor, in one transaction.
+// with s, sets the machine's cursor to s.Cursor and marks it as having a
+// snapshot, in one transaction.
 // Events, requests and results are kept.
 func (s *Store) ApplySnapshot(machineID string, snap agentlink.Snapshot) error {
 	now := ms(time.Now())
@@ -410,7 +453,7 @@ func (s *Store) ApplySnapshot(machineID string, snap agentlink.Snapshot) error {
 		return fmt.Errorf("server: apply snapshot: %w", err)
 	}
 	defer tx.Rollback()
-	res, err := tx.Exec(`UPDATE machines SET cursor = ?, last_seen_at = ? WHERE id = ?`, snap.Cursor, now, machineID)
+	res, err := tx.Exec(`UPDATE machines SET cursor = ?, last_seen_at = ?, has_snapshot = 1 WHERE id = ?`, snap.Cursor, now, machineID)
 	if err != nil {
 		return fmt.Errorf("server: apply snapshot: %w", err)
 	}
@@ -454,8 +497,20 @@ func validEventType(t string) bool {
 // and projects newly stored events onto items, artifacts and sessions. It
 // returns the greatest event ID in the batch and advances the machine's
 // cursor to it (never backwards), all in one transaction. A batch with an
-// unknown event type or undecodable data is rejected as a whole.
+// unknown event type or undecodable data is rejected as a whole with
+// ErrInvalidEvent.
 func (s *Store) AppendEvents(machineID string, evs []agentlink.Event) (string, error) {
+	return s.appendEvents(machineID, nil, evs)
+}
+
+// AppendEventsAfter is AppendEvents guarded by the machine's cursor: in the
+// same transaction, it fails with ErrCursorMismatch unless the stored cursor
+// equals after. An empty batch returns after.
+func (s *Store) AppendEventsAfter(machineID, after string, evs []agentlink.Event) (string, error) {
+	return s.appendEvents(machineID, &after, evs)
+}
+
+func (s *Store) appendEvents(machineID string, after *string, evs []agentlink.Event) (string, error) {
 	now := ms(time.Now())
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -469,10 +524,18 @@ func (s *Store) AppendEvents(machineID string, evs []agentlink.Event) (string, e
 		}
 		return "", fmt.Errorf("server: append events: %w", err)
 	}
+	if after != nil {
+		if cursor != *after {
+			return "", ErrCursorMismatch
+		}
+		if len(evs) == 0 {
+			return cursor, nil
+		}
+	}
 	var last string
 	for _, ev := range evs {
 		if ev.ID == "" || !validEventType(ev.Type) {
-			return "", fmt.Errorf("server: append events: invalid event id=%q type=%q", ev.ID, ev.Type)
+			return "", fmt.Errorf("%w: id=%q type=%q", ErrInvalidEvent, ev.ID, ev.Type)
 		}
 		var data any
 		if len(ev.Data) > 0 {
@@ -509,7 +572,7 @@ func project(tx *sql.Tx, machineID string, ev agentlink.Event, now int64) error 
 	case agentlink.EventItemUpsert:
 		var iv agentlink.ItemView
 		if err := json.Unmarshal(ev.Data, &iv); err != nil {
-			return err
+			return fmt.Errorf("%w: %v", ErrInvalidEvent, err)
 		}
 		if iv.ID == "" {
 			iv.ID = ev.ItemID
@@ -524,13 +587,13 @@ func project(tx *sql.Tx, machineID string, ev agentlink.Event, now int64) error 
 	case agentlink.EventArtifact:
 		var a agentlink.ArtifactView
 		if err := json.Unmarshal(ev.Data, &a); err != nil {
-			return err
+			return fmt.Errorf("%w: %v", ErrInvalidEvent, err)
 		}
 		return upsertArtifact(tx, machineID, ev.ItemID, a, now)
 	case agentlink.EventSession:
 		var sv agentlink.SessionView
 		if err := json.Unmarshal(ev.Data, &sv); err != nil {
-			return err
+			return fmt.Errorf("%w: %v", ErrInvalidEvent, err)
 		}
 		return upsertSession(tx, machineID, sv, now)
 	}
@@ -642,7 +705,28 @@ func (s *Store) enqueueRequest(machineID string, r agentlink.Request, now time.T
 	if err != nil {
 		return fmt.Errorf("server: enqueue request: %w", err)
 	}
+	s.notifier.notify(machineID) // wake the machine's long-poll, if any
 	return nil
+}
+
+// MarkDelivered marks the machine's pending requests with the given keys as
+// delivered. Requests in any other status are left alone.
+func (s *Store) MarkDelivered(machineID string, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("server: mark delivered: %w", err)
+	}
+	defer tx.Rollback()
+	for _, k := range keys {
+		if _, err := tx.Exec(`UPDATE requests SET status = ? WHERE machine_id = ? AND key = ? AND status = ?`,
+			RequestDelivered, machineID, k, RequestPending); err != nil {
+			return fmt.Errorf("server: mark delivered: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // PendingRequests returns the machine's pending or delivered requests that

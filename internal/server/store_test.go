@@ -52,7 +52,7 @@ func TestOpenStore_Tables(t *testing.T) {
 		}
 	}
 	var v int
-	if err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil || v != 1 {
+	if err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil || v != schemaVersion {
 		t.Errorf("schema_version = %d, %v", v, err)
 	}
 }
@@ -464,5 +464,42 @@ func TestEnqueueRequest_InvalidExpiry(t *testing.T) {
 	now := time.Now()
 	if err := s.enqueueRequest("m1", agentlink.Request{Key: "eq", Type: "inspect", ExpiresAt: now}, now); !errors.Is(err, ErrInvalidExpiry) {
 		t.Errorf("at now: err = %v", err)
+	}
+}
+
+func TestOpenStore_MigratesV1(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gtb.db")
+	s, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addMachine(t, s, "m1")
+	// Turn it back into a v1 database.
+	if _, err := s.db.Exec(`ALTER TABLE machines DROP COLUMN has_snapshot`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE schema_version SET version = 1`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s, err = OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var v int
+	if err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil || v != schemaVersion {
+		t.Fatalf("schema_version = %d, %v", v, err)
+	}
+	m, err := s.Machine("m1")
+	if err != nil || m.HasSnapshot {
+		t.Fatalf("machine = %+v, %v", m, err)
+	}
+	if err := s.ApplySnapshot("m1", agentlink.Snapshot{}); err != nil {
+		t.Fatal(err)
+	}
+	if m, _ := s.Machine("m1"); !m.HasSnapshot {
+		t.Fatal("has_snapshot not set after snapshot")
 	}
 }
