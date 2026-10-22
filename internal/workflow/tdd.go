@@ -39,8 +39,12 @@ const (
 
 	// exitNotRun is recorded when gtb refuses without running the command.
 	exitNotRun = -1
-	tailBytes  = 1000
+	tailBytes  = TailBytes
 )
+
+// TailBytes caps every stored output tail (TDD and check runs). A tail of
+// (nearly) this length was cut at its start.
+const TailBytes = 1000
 
 // ErrRefused is returned (wrapped) when Red or Green records a refused run.
 var ErrRefused = errors.New("workflow: run refused")

@@ -255,7 +255,9 @@ func (t *Town) Peek(_ context.Context, rigName, itemID string) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("no polecat session for %s", itemID)
 	}
-	return tmux.NewTmux().CapturePane(name, peekLines)
+	// -J joins wrapped lines so a secret split across screen lines is
+	// redacted whole (R38).
+	return tmux.NewTmux().CapturePaneJoined(name, peekLines)
 }
 
 // sessionForItem returns the tmux session of the polecat in rig whose hooked
@@ -269,6 +271,17 @@ func sessionForItem(ps []*polecat.Polecat, rigName, itemID string) string {
 	return ""
 }
 
+// execTailBytes caps the command output quoted in an ExecGtb error.
+const execTailBytes = 800
+
+// execTail redacts the whole output first, then keeps its last
+// execTailBytes, dropping the line the cut lands in (R38).
+func execTail(out string) string {
+	red := RedactText(out)
+	tail := lastBytes(red, execTailBytes)
+	return SafeTail(tail, len(tail) < len(red))
+}
+
 // ExecGtb runs the gtb binary at exe with args (argv only, no shell) in the
 // town root, returning an error carrying the tail of its output on failure.
 func (t *Town) ExecGtb(ctx context.Context, exe string, args ...string) error {
@@ -279,7 +292,7 @@ func (t *Town) ExecGtb(ctx context.Context, exe string, args ...string) error {
 	cmd.Stdin = nil
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("gtb %s: %w: %s", args[0], err, strings.TrimSpace(lastBytes(string(out), 800)))
+		return fmt.Errorf("gtb %s: %w: %s", args[0], err, strings.TrimSpace(execTail(string(out))))
 	}
 	return nil
 }

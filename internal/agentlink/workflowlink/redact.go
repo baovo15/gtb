@@ -64,6 +64,22 @@ var tokenRes = []*regexp.Regexp{
 	regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{20,}`),
 }
 
+// SafeTail returns s safe to send when it may have been cut at its start
+// (R38): a secret whose key or prefix was cut off ("…SSWORD=hunter2",
+// "…rization: Bearer …") no longer matches any RedactText pattern, so when
+// truncated is true everything up to and including the first newline is
+// dropped ("" when there is none). The rest goes through RedactText.
+func SafeTail(s string, truncated bool) string {
+	if truncated {
+		i := strings.IndexByte(s, '\n')
+		if i < 0 {
+			return ""
+		}
+		s = s[i+1:]
+	}
+	return RedactText(s)
+}
+
 // RedactText removes secrets from free-form text that leaves the machine
 // (command output tails, terminal captures, error messages):
 //   - every scheme://URL goes through RedactRemote (user info, query and

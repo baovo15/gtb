@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/steveyegge/gastown/internal/agentlink"
 	"github.com/steveyegge/gastown/internal/workflow"
@@ -101,6 +102,28 @@ func viewHash(iv agentlink.ItemView) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// tailTruncated reports whether a stored tail was cut at its start: it is at
+// workflow.TailBytes, less up to utf8.UTFMax-1 bytes the cut may skip to
+// reach a rune boundary. An output of exactly that size is also treated as
+// cut, which only costs its first line.
+func tailTruncated(tail string) bool {
+	return len(tail) > workflow.TailBytes-utf8.UTFMax
+}
+
+// checkTail is the outbound form of a check run's tail. A failed run's tail
+// is "<failing command>\n<end of its output>" (workflow capTail), so only
+// the output part can be cut at its start; the command line is kept.
+func checkTail(c workflow.CheckRun) string {
+	if c.Passed {
+		return SafeTail(c.Tail, tailTruncated(c.Tail))
+	}
+	cmd, out, ok := strings.Cut(c.Tail, "\n")
+	if !ok {
+		return SafeTail(c.Tail, false)
+	}
+	return SafeTail(cmd, false) + "\n" + SafeTail(out, tailTruncated(c.Tail))
+}
+
 // evidenceData projects a workflow evidence record into the JSON carried by
 // an evidence event. Command lines and output tails are command output and
 // go through RedactText (R37).
@@ -114,13 +137,13 @@ func evidenceData(data any) (json.RawMessage, bool) {
 		}
 	case workflow.TDDRun:
 		m = map[string]any{
-			"kind": "tdd", "plan_step": v.PlanStep, "phase": v.Phase, "cmd": RedactText(v.Cmd), "exit": v.Exit,
-			"tail": RedactText(v.Tail), "source": v.Source, "provenance": v.Provenance, "at": v.At.UTC(),
+			"kind": "tdd", "plan_step": v.PlanStep, "phase": v.Phase, "cmd": SafeTail(v.Cmd, false), "exit": v.Exit,
+			"tail": SafeTail(v.Tail, tailTruncated(v.Tail)), "source": v.Source, "provenance": v.Provenance, "at": v.At.UTC(),
 		}
 	case workflow.CheckRun:
 		m = map[string]any{
 			"kind": "check", "cmd_set_sha": v.CmdSetSHA, "passed": v.Passed,
-			"tail": RedactText(v.Tail), "source": v.Source, "provenance": v.Provenance, "at": v.At.UTC(),
+			"tail": checkTail(v), "source": v.Source, "provenance": v.Provenance, "at": v.At.UTC(),
 		}
 	default:
 		return nil, false

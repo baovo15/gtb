@@ -289,7 +289,7 @@ func TestApply_InspectAndPeek(t *testing.T) {
 	if iv.ID != id || iv.Step != "spec" || len(iv.Artifacts) != 1 || iv.Artifacts[0].SHA != sha || iv.Artifacts[0].Content != "spec\n" || len(iv.Diffstat) != 0 {
 		t.Fatalf("inspect view = %+v", iv)
 	}
-	f.peeked = strings.Repeat("é", 40<<10) // 80 KiB
+	f.peeked = strings.Repeat(strings.Repeat("é", 63)+"\n", 650) // ~80 KiB of lines
 	res = f.app.Apply(context.Background(), req("terminal.peek", id, nil))
 	var pk struct {
 		Lines string `json:"lines"`
@@ -580,5 +580,104 @@ func TestOutgoingFreeTextRedacted(t *testing.T) {
 	})
 	if b, _ := json.Marshal(iv); strings.Contains(string(b), secret) {
 		t.Fatalf("item view leaks: %s", b)
+	}
+}
+
+// R38: text truncated at its start loses its (possibly cut) first line
+// before redaction.
+func TestSafeTail(t *testing.T) {
+	cases := []struct {
+		in        string
+		truncated bool
+		want      string
+	}{
+		{"SSWORD=hunter2 x\nok line\n", true, "ok line\n"},
+		{"KEN=abc\n", true, ""},
+		{"rization: Bearer eyJhbGci\nnext", true, "next"},
+		{"no newline at all hunter2", true, ""},
+		{"first line\nsecond", false, "first line\nsecond"},
+		{"token=abc\nrest", false, "token=<redacted>\nrest"},
+	}
+	for _, c := range cases {
+		if got := SafeTail(c.in, c.truncated); got != c.want {
+			t.Errorf("SafeTail(%q, %v) = %q, want %q", c.in, c.truncated, got, c.want)
+		}
+	}
+}
+
+func padTo(s string, n int) string {
+	if len(s) >= n {
+		return s[:n]
+	}
+	return s + strings.Repeat("a", n-len(s))
+}
+
+func TestEvidenceTail_TruncatedFirstLineDropped(t *testing.T) {
+	cut := padTo("SSWORD=hunter2 trailing\n"+strings.Repeat("line\n", 50), workflow.TailBytes)
+	for name, rec := range map[string]any{
+		"tdd":          workflow.TDDRun{Tail: cut},
+		"check passed": workflow.CheckRun{Passed: true, Tail: cut},
+		// A failed check tail is capTail: "<cmd>\n" + end of output, so the
+		// cut line is the second one; the command line is kept.
+		"check failed": workflow.CheckRun{Passed: false, Tail: padTo("make check\nSSWORD=hunter2 x\n"+strings.Repeat("line\n", 50), workflow.TailBytes)},
+	} {
+		b, _ := evidenceData(rec)
+		if strings.Contains(string(b), "hunter2") {
+			t.Fatalf("%s: leaked: %.120s", name, b)
+		}
+		if name == "check failed" && !strings.Contains(string(b), `"tail":"make check\nline`) {
+			t.Fatalf("%s: command line not kept: %.120s", name, b)
+		}
+	}
+	short, _ := evidenceData(workflow.TDDRun{Tail: "first line kept\n--- FAIL"})
+	if !strings.Contains(string(short), "first line kept") {
+		t.Fatalf("untruncated tail lost its first line: %s", short)
+	}
+	shortCheck, _ := evidenceData(workflow.CheckRun{Tail: "make check\nfirst output line\nFAIL"})
+	if !strings.Contains(string(shortCheck), "make check\\nfirst output line") {
+		t.Fatalf("untruncated check tail changed: %s", shortCheck)
+	}
+}
+
+func TestExecGtb_SecretNearCutNotLeaked(t *testing.T) {
+	tw := NewTown(t.TempDir(), nil)
+	// Output is 805 bytes; the last 800 start inside "GH_TOKEN".
+	script := `printf 'GH_TOKEN=SECRETVAL\n'; head -c 785 /dev/zero | tr '\0' a; printf '\n'; exit 1`
+	err := tw.ExecGtb(context.Background(), "/bin/sh", "-c", script)
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if strings.Contains(err.Error(), "SECRETVAL") {
+		t.Fatalf("secret leaked: %.200s", err)
+	}
+	if !strings.Contains(err.Error(), "aaaa") {
+		t.Fatalf("output tail missing: %.200s", err)
+	}
+}
+
+// R38: a peek capture over the cap loses the line the cut lands in.
+func TestPeek_CutLineDropped(t *testing.T) {
+	f := newFixture(t)
+	id, _ := f.item(t, "x\n")
+	// After redaction the secret line reads "export DB_PASSWORD=<redacted>";
+	// make the 64 KiB cut land inside it, so the kept part starts "SSWORD=".
+	line := "export DB_PASSWORD=<redacted>\n"
+	body := strings.Repeat("b", maxPeekBytes-len("SSWORD=<redacted>\n")-1) + "\n"
+	f.peeked = "x\nexport DB_PASSWORD=hunter2\n" + body
+	if red := RedactText(f.peeked); !strings.HasSuffix(red, "SSWORD=<redacted>\n"+body) || len(red)-len(body) <= len(line) {
+		t.Fatalf("fixture does not cut inside the key")
+	}
+	res := f.app.Apply(context.Background(), req("terminal.peek", id, nil))
+	if !res.OK || strings.Contains(string(res.Data), "hunter2") || strings.Contains(string(res.Data), "SSWORD") {
+		t.Fatalf("peek leaked: ok=%v %.80s", res.OK, res.Data)
+	}
+	// Without the R38 rule the cut line would be sent; the kept text is the
+	// complete lines after it.
+	var pk struct {
+		Lines string `json:"lines"`
+	}
+	json.Unmarshal(res.Data, &pk)
+	if pk.Lines != body {
+		t.Fatalf("lines = %d bytes, want the %d-byte body", len(pk.Lines), len(body))
 	}
 }

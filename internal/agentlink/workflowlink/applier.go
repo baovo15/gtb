@@ -302,7 +302,9 @@ func (a *WorkflowApplier) peek(ctx context.Context, r agentlink.Request) agentli
 	}
 	// Redact before capping so a secret cut at the cap boundary cannot
 	// survive in part (R37).
-	return agentlink.Result{OK: true, Data: mustJSON(map[string]string{"lines": lastBytes(RedactText(out), maxPeekBytes)})}
+	red := RedactText(out)
+	lines := lastBytes(red, maxPeekBytes)
+	return agentlink.Result{OK: true, Data: mustJSON(map[string]string{"lines": SafeTail(lines, len(lines) < len(red))})}
 }
 
 // lastBytes returns the longest suffix of s of at most n bytes that starts on
