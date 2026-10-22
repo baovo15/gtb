@@ -6,7 +6,8 @@ import (
 )
 
 // Advance moves item itemID to its next step when its current step's gate
-// passes. The current step is the store-derived one (see effectiveStep).
+// passes. The current step is the store-derived one (see effectiveStep). An
+// epic that passes its last step (verification) moves to StepDone.
 //
 // A failed gate returns the item and the result with a nil error and records
 // nothing. A lost race returns the error from Store.Transition (wrapping
@@ -18,7 +19,7 @@ func Advance(env GateEnv, itemID, actor string) (*Item, GateResult, error) {
 	if err != nil {
 		return nil, GateResult{}, err
 	}
-	cur, entered, err := effectiveStep(env, it)
+	cur, entered, _, err := effectiveStep(env, it)
 	if err != nil {
 		return nil, GateResult{}, fmt.Errorf("workflow: reading transitions for %s: %w", itemID, err)
 	}
@@ -29,6 +30,11 @@ func Advance(env GateEnv, itemID, actor string) (*Item, GateResult, error) {
 		return it, res, nil
 	}
 	next, ok := Next(it.Kind, cur)
+	if !ok && it.Kind == KindEpic {
+		// Epics have no merge step: passing verification finishes the epic.
+		// Tasks and fixes reach done only through the refinery.
+		next, ok = StepDone, true
+	}
 	if !ok {
 		res.Passed = false
 		res.Reasons = append(res.Reasons, fmt.Sprintf("%s is the last step", cur))

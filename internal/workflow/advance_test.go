@@ -171,19 +171,56 @@ func TestAdvance_MergeNeverPasses(t *testing.T) {
 	assertGate(t, res, false, "", "merge is performed by the refinery")
 }
 
-func TestAdvance_LastEpicStep(t *testing.T) {
+// R11: epics have no merge step; passing verification finishes the epic.
+func TestAdvance_EpicVerificationToDone(t *testing.T) {
 	env := newTestEnv(t)
 	it := newItemAt(t, env, KindEpic, "verification", time.Now())
 	writeArtifact(t, env, it.ID, "verification", "ok\n")
+	before, _ := env.Store.Transitions(it.ID)
+	// Not approved yet: no transition.
+	if _, res, err := Advance(env, it.ID, "me"); err != nil || res.Passed {
+		t.Fatalf("unapproved Advance = %+v, %v", res, err)
+	}
 	approve(t, env, it.ID, "verification")
-	_, res, err := Advance(env, it.ID, "me")
+	got, res, err := Advance(env, it.ID, "me")
+	if err != nil || !res.Passed {
+		t.Fatalf("Advance = %+v, %v", res, err)
+	}
+	if got.Step != StepDone {
+		t.Fatalf("step = %s, want done", got.Step)
+	}
+	trs, _ := env.Store.Transitions(it.ID)
+	if len(trs) != len(before)+1 {
+		t.Fatalf("transitions = %+v", trs)
+	}
+	if last := trs[len(trs)-1]; last.From != "verification" || last.To != StepDone || last.Actor != "me" {
+		t.Fatalf("last transition = %+v", last)
+	}
+	stored, err := env.Items.Get(it.ID)
+	must(t, err)
+	if stored.Step != StepDone {
+		t.Fatalf("bead step = %s, want done", stored.Step)
+	}
+	_, res, err = Advance(env, it.ID, "me")
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertGate(t, res, false, "", "verification is the last step")
-	trs, _ := env.Store.Transitions(it.ID)
-	if len(trs) != 0 {
-		t.Fatalf("transitions = %+v", trs)
+	assertGate(t, res, false, "", "item is done")
+}
+
+// Tasks and fixes still reach done only through the refinery.
+func TestAdvance_TaskMergeNotDone(t *testing.T) {
+	for _, k := range []Kind{KindTask, KindFix} {
+		env := newTestEnv(t)
+		it := newItemAt(t, env, k, "merge", time.Now())
+		before, _ := env.Store.Transitions(it.ID)
+		got, res, err := Advance(env, it.ID, "me")
+		if err != nil || res.Passed || got.Step != "merge" {
+			t.Fatalf("%s: Advance = %+v, %+v, %v", k, got, res, err)
+		}
+		if after, _ := env.Store.Transitions(it.ID); len(after) != len(before) {
+			t.Fatalf("%s: transitions changed: %+v", k, after)
+		}
 	}
 }
 

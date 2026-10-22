@@ -304,15 +304,19 @@ func (d *doltStore) Checks(id string) ([]CheckRun, error) {
 }
 
 // raceErr maps the errors a lost Transition race produces to ErrStepConflict:
-// a duplicate (item_id, seq) key on insert, or Dolt rejecting the commit
-// because a concurrent transaction committed the same key first. Other
-// errors are returned wrapped as-is.
+// a duplicate (item_id, seq) key on insert (1062), Dolt rejecting the commit
+// because a concurrent transaction committed the same key first (1105 with
+// "constraint violation"), or Dolt's optimistic commit failing with 1213
+// (40001 "serialization failure: this transaction conflicts with a committed
+// transaction from another client"). Verified against Dolt 2.0.7
+// (dolthub/dolt-sql-server:2.0.7, testutil.DoltDockerImage). Other errors
+// are returned wrapped as-is.
 func raceErr(id, op string, err error) error {
 	if err == nil {
 		return nil
 	}
 	var me *mysql.MySQLError
-	if errors.As(err, &me) && (me.Number == 1062 || strings.Contains(me.Message, "constraint violation")) {
+	if errors.As(err, &me) && (me.Number == 1062 || me.Number == 1213 || strings.Contains(me.Message, "constraint violation")) {
 		return fmt.Errorf("%w: item %s advanced concurrently: %v", ErrStepConflict, id, err)
 	}
 	return wrap(op, err)

@@ -40,22 +40,48 @@ func newTestEnv(t *testing.T) GateEnv {
 	}
 }
 
-// newItemAt creates an item of kind k and moves it (bead only, no
-// transitions) to step s, entered at the given time.
+// newItemAt creates an item of kind k at step s. For the kind's first step
+// the bead is set to s entered at the given time and no transitions exist.
+// For any later step (StepDone included) real store history is recorded
+// from the first step to s, and the bead mirrors the last transition (so
+// entered is ignored).
 func newItemAt(t *testing.T, env GateEnv, k Kind, s Step, entered time.Time) *Item {
 	t.Helper()
-	it, err := env.Items.Create(env.Rig, k, "t", "")
-	if err != nil {
-		t.Fatal(err)
+	return newChildAt(t, env, k, "", s, entered)
+}
+
+func newChildAt(t *testing.T, env GateEnv, k Kind, parent string, s Step, entered time.Time) *Item {
+	t.Helper()
+	it, err := env.Items.Create(env.Rig, k, "t", parent)
+	must(t, err)
+	if s != firstStep(k) {
+		walkTo(t, env, it.ID, k, s)
+		trs, err := env.Store.Transitions(it.ID)
+		must(t, err)
+		entered = trs[len(trs)-1].At
 	}
-	if err := env.Items.SetStep(it.ID, s, entered); err != nil {
-		t.Fatal(err)
-	}
+	must(t, env.Items.SetStep(it.ID, s, entered))
 	it, err = env.Items.Get(it.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	return it
+}
+
+// walkTo records store transitions for item id from its kind's first step
+// to s. StepDone is reached from the kind's last step.
+func walkTo(t *testing.T, env GateEnv, id string, k Kind, s Step) {
+	t.Helper()
+	cur := firstStep(k)
+	for cur != s {
+		next, ok := Next(k, cur)
+		if !ok {
+			if s != StepDone {
+				t.Fatalf("walkTo: step %s not reachable for %s", s, k)
+			}
+			next = StepDone
+		}
+		must(t, env.Store.Transition(id, cur, next, "walk"))
+		cur = next
+	}
 }
 
 func writeArtifact(t *testing.T, env GateEnv, id, name, content string) {
@@ -235,8 +261,7 @@ func TestGate_TaskPlan(t *testing.T) {
 	}
 	loops := func(n int) func(t *testing.T, env GateEnv, it *Item) {
 		return func(t *testing.T, env GateEnv, it *Item) {
-			planOK(t, env, it)
-			must(t, env.Store.Transition(it.ID, "spec", "plan", "x"))
+			planOK(t, env, it) // newItemAt already recorded spec -> plan
 			for i := 0; i < n; i++ {
 				must(t, env.Store.Transition(it.ID, "plan", "execute", "x"))
 				must(t, env.Store.Transition(it.ID, "execute", "plan", "x"))
@@ -265,6 +290,7 @@ func TestGate_TaskExecute(t *testing.T) {
 	plan := func(steps string) func(t *testing.T, env GateEnv, it *Item) {
 		return func(t *testing.T, env GateEnv, it *Item) {
 			writeArtifact(t, env, it.ID, "plan", "---\nsteps: "+steps+"\n---\nplan\n")
+			approve(t, env, it.ID, "plan")
 		}
 	}
 	both := func(t *testing.T, env GateEnv, it *Item, step string) {
@@ -294,6 +320,10 @@ func TestGate_TaskExecute(t *testing.T) {
 		}},
 		{name: "no steps", kind: KindTask, step: "execute", reasonSub: "plan.md must list steps", setup: plan("")},
 		{name: "plan missing", kind: KindTask, step: "execute", reasonSub: "plan.md missing"},
+		{name: "plan never approved", kind: KindTask, step: "execute", waiting: "approve plan", reasonSub: "approve plan", setup: func(t *testing.T, env GateEnv, it *Item) {
+			writeArtifact(t, env, it.ID, "plan", "---\nsteps: a\n---\n")
+			both(t, env, it, "a")
+		}},
 	})
 }
 
@@ -307,8 +337,9 @@ func checkPass(at time.Time) func(t *testing.T, env GateEnv, it *Item) {
 func TestGate_Verify(t *testing.T) {
 	now := time.Now()
 	runGateCases(t, []gateCase{
-		{name: "task fresh pass", kind: KindTask, step: "verify", passed: true, setup: checkPass(now)},
-		{name: "fix fresh pass", kind: KindFix, step: "verify", passed: true, setup: checkPass(now)},
+		// A zero At is stamped "now" by the store, i.e. after entering verify.
+		{name: "task fresh pass", kind: KindTask, step: "verify", passed: true, setup: checkPass(time.Time{})},
+		{name: "fix fresh pass", kind: KindFix, step: "verify", passed: true, setup: checkPass(time.Time{})},
 		{name: "no check", kind: KindTask, step: "verify", reasonSub: "no passing check since entering verify"},
 		{name: "failed check", kind: KindFix, step: "verify", reasonSub: "no passing check since entering verify", setup: func(t *testing.T, env GateEnv, it *Item) {
 			must(t, env.Store.AddCheck(CheckRun{ItemID: it.ID, CmdSetSHA: CheckCommandsSHA(testChecks), Passed: false, At: now}))
@@ -325,8 +356,8 @@ func TestGate_Verify(t *testing.T) {
 
 func TestGate_VerifyRequiresFreshCheck(t *testing.T) {
 	env := newTestEnv(t)
-	entered := time.Now()
-	it := newItemAt(t, env, KindTask, "verify", entered)
+	it := newItemAt(t, env, KindTask, "verify", time.Time{})
+	entered := it.StepEnteredAt // the store's transition into verify
 	checkPass(entered.Add(-time.Second))(t, env, it)
 	assertGate(t, Gate(env, it), false, "", "no passing check since entering verify")
 	checkPass(entered)(t, env, it)
@@ -341,6 +372,10 @@ func TestGate_FixReproduce(t *testing.T) {
 		}},
 		{name: "manual repro", kind: KindFix, step: "reproduce", passed: true, setup: func(t *testing.T, env GateEnv, it *Item) {
 			writeArtifact(t, env, it.ID, "report", "---\nrepro: 'manual'\n---\nsteps\n")
+			approve(t, env, it.ID, "report")
+		}},
+		{name: "manual repro never approved", kind: KindFix, step: "reproduce", waiting: "approve report", reasonSub: "approve report", setup: func(t *testing.T, env GateEnv, it *Item) {
+			writeArtifact(t, env, it.ID, "report", "---\nrepro: manual\n---\nsteps\n")
 		}},
 		{name: "unverified red", kind: KindFix, step: "reproduce", reasonSub: "no verified red for repro", setup: func(t *testing.T, env GateEnv, it *Item) {
 			addTDD(t, env, it.ID, "repro", "red", "claimed", time.Now())
@@ -410,6 +445,7 @@ func TestGate_EpicBreakdown(t *testing.T) {
 	setup := func(epic, breakdown string) func(t *testing.T, env GateEnv, it *Item) {
 		return func(t *testing.T, env GateEnv, it *Item) {
 			writeArtifact(t, env, it.ID, "epic", epic)
+			approve(t, env, it.ID, "epic")
 			writeArtifact(t, env, it.ID, "breakdown", breakdown)
 			approve(t, env, it.ID, "breakdown")
 		}
@@ -438,10 +474,7 @@ func TestGate_EpicBreakdown(t *testing.T) {
 // Row: epic/tasks.
 func TestGate_EpicTasks(t *testing.T) {
 	child := func(t *testing.T, env GateEnv, parent string, s Step) *Item {
-		c, err := env.Items.Create(env.Rig, KindTask, "c", parent)
-		must(t, err)
-		must(t, env.Items.SetStep(c.ID, s, time.Now()))
-		return c
+		return newChildAt(t, env, KindTask, parent, s, time.Now())
 	}
 	runGateCases(t, []gateCase{
 		{name: "all done", kind: KindEpic, step: "tasks", passed: true, setup: func(t *testing.T, env GateEnv, it *Item) {
@@ -454,8 +487,8 @@ func TestGate_EpicTasks(t *testing.T) {
 			child(t, env, it.ID, "merge")
 		}},
 		{name: "store step wins for child", kind: KindEpic, step: "tasks", reasonSub: "is at merge, not done", setup: func(t *testing.T, env GateEnv, it *Item) {
-			c := child(t, env, it.ID, StepDone)
-			must(t, env.Store.Transition(c.ID, "review", "merge", "x"))
+			c := child(t, env, it.ID, "merge")
+			must(t, env.Items.SetStep(c.ID, StepDone, time.Now())) // bead claims done
 		}},
 		{name: "no children", kind: KindEpic, step: "tasks", reasonSub: "epic has no child items"},
 	})
@@ -489,16 +522,16 @@ func TestEffectiveStep(t *testing.T) {
 	env := newTestEnv(t)
 	entered := time.Now().Add(-time.Hour).UTC()
 	it := newItemAt(t, env, KindTask, "spec", entered)
-	s, at, err := effectiveStep(env, it)
+	s, at, hist, err := effectiveStep(env, it)
 	must(t, err)
-	if s != "spec" || !at.Equal(entered) {
-		t.Fatalf("no transitions: got %s %v, want spec %v", s, at, entered)
+	if s != "spec" || !at.Equal(entered) || hist {
+		t.Fatalf("no transitions: got %s %v %v, want spec %v false", s, at, hist, entered)
 	}
 	must(t, env.Store.Transition(it.ID, "spec", "plan", "x"))
 	trs, _ := env.Store.Transitions(it.ID)
-	s, at, err = effectiveStep(env, it)
+	s, at, hist, err = effectiveStep(env, it)
 	must(t, err)
-	if s != "plan" || !at.Equal(trs[0].At) {
+	if s != "plan" || !at.Equal(trs[0].At) || !hist {
 		t.Fatalf("with transition: got %s %v, want plan %v", s, at, trs[0].At)
 	}
 }
@@ -525,4 +558,89 @@ func TestGitChangedFiles_NilBranch(t *testing.T) {
 	if _, err := (GitChangedFiles{RepoDir: t.TempDir(), Base: "main"}).Changed("x"); err == nil {
 		t.Fatal("want error for nil Branch")
 	}
+}
+
+// R12: content-reading gates require the content's current version approved.
+func TestGate_ContentEditAfterApproval(t *testing.T) {
+	cases := []struct {
+		name     string
+		kind     Kind
+		step     Step
+		artifact string
+		setup    func(t *testing.T, env GateEnv, it *Item)
+		prePass  bool // the gate passes before the edit
+		edit     string
+	}{
+		{name: "plan steps", kind: KindTask, step: "execute", artifact: "plan",
+			setup: func(t *testing.T, env GateEnv, it *Item) {
+				writeArtifact(t, env, it.ID, "plan", "---\nsteps: a,b\n---\n")
+				approve(t, env, it.ID, "plan")
+				addTDD(t, env, it.ID, "a", "red", "verified", time.Now())
+				addTDD(t, env, it.ID, "a", "green", "verified", time.Now().Add(time.Second))
+			},
+			// Step b has no evidence; dropping it would otherwise pass.
+			edit: "---\nsteps: a\n---\n"},
+		{name: "report manual repro", kind: KindFix, step: "reproduce", artifact: "report",
+			setup: func(t *testing.T, env GateEnv, it *Item) {
+				writeArtifact(t, env, it.ID, "report", "---\nrepro: manual\n---\nsteps v1\n")
+				approve(t, env, it.ID, "report")
+			},
+			prePass: true,
+			edit:    "---\nrepro: manual\n---\nsteps v2\n"},
+		{name: "epic ACs", kind: KindEpic, step: "breakdown", artifact: "epic",
+			setup: func(t *testing.T, env GateEnv, it *Item) {
+				writeArtifact(t, env, it.ID, "epic", "AC1 a\nAC2 b\n")
+				approve(t, env, it.ID, "epic")
+				writeArtifact(t, env, it.ID, "breakdown", "AC1 AC2\n")
+				approve(t, env, it.ID, "breakdown")
+			},
+			// Dropping AC2 must void the epic approval.
+			prePass: true,
+			edit:    "AC1 a\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newTestEnv(t)
+			it := newItemAt(t, env, tc.kind, tc.step, time.Now())
+			tc.setup(t, env, it)
+			if before := Gate(env, it); before.Passed != tc.prePass {
+				t.Fatalf("before edit: %+v, want passed=%v", before, tc.prePass)
+			}
+			writeArtifact(t, env, it.ID, tc.artifact, tc.edit)
+			assertGate(t, Gate(env, it), false, "approve "+tc.artifact, tc.artifact+".md changed since approval")
+		})
+	}
+}
+
+// R10: a bead relabelled past the first step without store history is refused.
+func TestGate_BeadRelabelWithoutHistoryRefused(t *testing.T) {
+	env := newTestEnv(t)
+	it, err := env.Items.Create(env.Rig, KindTask, "t", "")
+	must(t, err)
+	must(t, env.Items.SetStep(it.ID, "verify", time.Now().Add(-time.Hour)))
+	checkPass(time.Now())(t, env, it)
+	it, err = env.Items.Get(it.ID)
+	must(t, err)
+	got := Gate(env, it)
+	assertGate(t, got, false, "", "")
+	if !reflect.DeepEqual(got.Reasons, []string{"no transition history for step verify"}) {
+		t.Fatalf("reasons = %q", got.Reasons)
+	}
+	if _, res, err := Advance(env, it.ID, "me"); err != nil || res.Passed {
+		t.Fatalf("Advance = %+v, %v", res, err)
+	}
+	if trs, _ := env.Store.Transitions(it.ID); len(trs) != 0 {
+		t.Fatalf("Advance transitioned a relabelled item: %+v", trs)
+	}
+}
+
+// R10: a child counts as done only from its store history.
+func TestGate_EpicTasks_BeadOnlyDoneNotCounted(t *testing.T) {
+	env := newTestEnv(t)
+	epic := newItemAt(t, env, KindEpic, "tasks", time.Now())
+	newChildAt(t, env, KindTask, epic.ID, StepDone, time.Now())
+	c, err := env.Items.Create(env.Rig, KindTask, "c", epic.ID)
+	must(t, err)
+	must(t, env.Items.SetStep(c.ID, StepDone, time.Now()))
+	assertGate(t, Gate(env, epic), false, "", "child "+c.ID+" has no transition history, not done")
 }

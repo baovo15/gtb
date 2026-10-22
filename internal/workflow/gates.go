@@ -70,19 +70,30 @@ const (
 	reproStep             = "repro"
 )
 
-// effectiveStep returns the item's current step and the time it entered it.
-// The evidence store arbitrates: when transitions exist, the latest
-// transition's To and At win over the bead's Step and StepEnteredAt.
-func effectiveStep(env GateEnv, it *Item) (Step, time.Time, error) {
+// effectiveStep returns the item's current step, the time it entered it, and
+// whether the store has transition history for it. The evidence store
+// arbitrates: when transitions exist, the latest transition's To and At win
+// over the bead's Step and StepEnteredAt. Without history the bead's values
+// are returned; callers must accept them only for the kind's first step
+// (see Gate), since the bead is agent-editable.
+func effectiveStep(env GateEnv, it *Item) (step Step, entered time.Time, history bool, err error) {
 	trs, err := env.Store.Transitions(it.ID)
 	if err != nil {
-		return "", time.Time{}, err
+		return "", time.Time{}, false, err
 	}
 	if len(trs) == 0 {
-		return it.Step, it.StepEnteredAt, nil
+		return it.Step, it.StepEnteredAt, false, nil
 	}
 	last := trs[len(trs)-1]
-	return last.To, last.At, nil
+	return last.To, last.At, true, nil
+}
+
+// firstStep returns the first step of kind k, or "" for an unknown kind.
+func firstStep(k Kind) Step {
+	if steps := stepTables[k]; len(steps) > 0 {
+		return steps[0]
+	}
+	return ""
 }
 
 // unquote trims surrounding whitespace and one pair of matching quotes.
@@ -147,11 +158,22 @@ func (g *gateCtx) artifact(name string) (content []byte, sha string, fm map[stri
 	return content, sha, fm, true
 }
 
-// approved checks the human approval of artifact name at sha. The latest
-// human decision (by At, the last appended winning ties) decides: an approve
-// must match sha; a newer request_changes or reject blocks, and also waits
-// for a human when the artifact has been revised since that request.
-func (g *gateCtx) approved(name, sha string, approvals []Approval) {
+// decision is the state of the human decisions on one artifact relative to
+// its current sha.
+type decision int
+
+const (
+	neverApproved       decision = iota // no human decision at all
+	approvedCurrent                     // latest human decision approves the current sha
+	approvedStale                       // latest human decision approves an older sha
+	changesRequested                    // latest human decision is reject/request_changes on the current sha
+	changesRequestedOld                 // as above, but the artifact was revised since
+)
+
+// humanDecision classifies the latest human decision on artifact name (by
+// At, the last appended winning ties) against the current sha. Only
+// Role=="human" records with verdict approve, reject or request_changes count.
+func humanDecision(name, sha string, approvals []Approval) decision {
 	var decisions []Approval
 	for _, a := range approvals {
 		if a.Artifact != name || a.Role != roleHuman {
@@ -163,34 +185,83 @@ func (g *gateCtx) approved(name, sha string, approvals []Approval) {
 		}
 	}
 	sort.SliceStable(decisions, func(i, j int) bool { return decisions[i].At.Before(decisions[j].At) })
-	if n := len(decisions); n > 0 {
-		last := decisions[n-1]
-		if last.Verdict == verdictApprove && last.SHA == sha {
-			return
-		}
-		if last.Verdict != verdictApprove {
-			g.fail("changes requested on %s", name)
-			if last.SHA != sha {
-				// Revised since the request: a human must look again.
-				g.wait("approve " + name)
-			}
-			return
-		}
+	if len(decisions) == 0 {
+		return neverApproved
 	}
-	g.fail("%s.md not approved", name)
+	last := decisions[len(decisions)-1]
+	switch {
+	case last.Verdict == verdictApprove && last.SHA == sha:
+		return approvedCurrent
+	case last.Verdict == verdictApprove:
+		return approvedStale
+	case last.SHA == sha:
+		return changesRequested
+	default:
+		return changesRequestedOld
+	}
+}
+
+// approved is the step artifact gate: artifact name must be human-approved
+// at its current sha. A newer request_changes or reject blocks, and also
+// waits for a human when the artifact has been revised since that request.
+func (g *gateCtx) approved(name, sha string, approvals []Approval) {
+	switch humanDecision(name, sha, approvals) {
+	case approvedCurrent:
+	case changesRequested:
+		g.fail("changes requested on %s", name)
+	case changesRequestedOld:
+		g.fail("changes requested on %s", name)
+		g.wait("approve " + name)
+	default:
+		g.fail("%s.md not approved", name)
+		g.wait("approve " + name)
+	}
+}
+
+// approvedContent reads artifact name for a gate that relies on its content
+// (an obligation the agent could otherwise shrink by editing it). ok is true
+// only when the latest human decision approves the current sha; otherwise a
+// reason is recorded and the gate waits for a human approval.
+func (g *gateCtx) approvedContent(name string) (content []byte, fm map[string]string, ok bool) {
+	content, sha, fm, ok := g.artifact(name)
+	if !ok {
+		return nil, nil, false
+	}
+	approvals, err := g.env.Store.Approvals(g.it.ID)
+	if err != nil {
+		g.fail("reading approvals: %v", err)
+		return nil, nil, false
+	}
+	switch humanDecision(name, sha, approvals) {
+	case approvedCurrent:
+		return content, fm, true
+	case neverApproved:
+		g.fail("approve %s", name)
+	case changesRequested, changesRequestedOld:
+		g.fail("changes requested on %s", name)
+	default:
+		g.fail("%s.md changed since approval", name)
+	}
 	g.wait("approve " + name)
+	return nil, nil, false
 }
 
 // Gate evaluates whether item it may leave its current step. The current
 // step is the store-derived one (see effectiveStep), not necessarily it.Step.
 func Gate(env GateEnv, it *Item) GateResult {
 	g := &gateCtx{env: env, it: it, cfg: gateConfig(env)}
-	step, entered, err := effectiveStep(env, it)
+	step, entered, history, err := effectiveStep(env, it)
 	if err != nil {
 		g.fail("reading transitions: %v", err)
 		return g.res
 	}
 	g.step, g.entered = step, entered
+	if !history && step != firstStep(it.Kind) {
+		// The bead alone cannot place an item past its first step: the
+		// store accepts any first transition, so trusting it would skip gates.
+		g.fail("no transition history for step %s", step)
+		return g.res
+	}
 
 	switch step {
 	case StepDone:
@@ -318,7 +389,7 @@ func redThenGreen(runs []TDDRun, planStep string) bool {
 }
 
 func (g *gateCtx) executeGate() {
-	_, _, fm, ok := g.artifact("plan")
+	_, fm, ok := g.approvedContent("plan")
 	if !ok {
 		return
 	}
@@ -375,6 +446,8 @@ func (g *gateCtx) reproduceGate() {
 	}
 	path := ArtifactPath(g.env.TownRoot, g.env.Rig, g.it.ID, "report")
 	if _, _, fm, err := ReadArtifact(path); err == nil && unquote(fm["repro"]) == "manual" {
+		// A manual repro is only as good as the human-approved report.
+		g.approvedContent("report")
 		return
 	}
 	g.fail("no verified red for repro (or set repro: manual in report.md)")
@@ -414,7 +487,8 @@ func body(content []byte) string {
 }
 
 func (g *gateCtx) breakdownGate() {
-	epic, _, _, ok := g.artifact("epic")
+	// The breakdown's own approval is checked by the step artifact gate.
+	epic, _, ok := g.approvedContent("epic")
 	if !ok {
 		return
 	}
@@ -515,12 +589,14 @@ func (g *gateCtx) tasksGate() {
 			continue
 		}
 		children++
-		s, _, err := effectiveStep(g.env, c)
-		if err != nil {
+		// Only the store's history counts: a bead labelled done is not.
+		s, _, history, err := effectiveStep(g.env, c)
+		switch {
+		case err != nil:
 			g.fail("child %s: reading transitions: %v", c.ID, err)
-			continue
-		}
-		if s != StepDone {
+		case !history:
+			g.fail("child %s has no transition history, not done", c.ID)
+		case s != StepDone:
 			g.fail("child %s is at %s, not done", c.ID, s)
 		}
 	}
