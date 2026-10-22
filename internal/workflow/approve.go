@@ -65,6 +65,9 @@ func currentArtifactSHA(env GateEnv, itemID, artifact string) (string, error) {
 // artifact sha. Only a confirmed answer is recorded, with Role and Source
 // "human", Channel "terminal" and SHA the hash that was shown.
 func HumanApprove(env GateEnv, t Terminal, getenv func(string) string, itemID, artifact, verdict, actor string) (Approval, error) {
+	if err := validateID(itemID); err != nil {
+		return Approval{}, err
+	}
 	for _, k := range AgentMarkerEnv {
 		if getenv(k) != "" {
 			return Approval{}, fmt.Errorf("%w (%s is set)", ErrNotHuman, k)
@@ -102,6 +105,9 @@ func HumanApprove(env GateEnv, t Terminal, getenv func(string) string, itemID, a
 // reject) on the current content of artifact. role is free-form but may not
 // be "human" (case-insensitive, trimmed); Source is always "agent".
 func RecordVerdict(env GateEnv, itemID, artifact, role, verdict, actor string) (Approval, error) {
+	if err := validateID(itemID); err != nil {
+		return Approval{}, err
+	}
 	role = strings.TrimSpace(role)
 	if role == "" {
 		return Approval{}, errors.New("workflow: reviewer role is required")

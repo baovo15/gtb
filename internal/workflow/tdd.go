@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -43,6 +44,32 @@ const (
 
 // ErrRefused is returned (wrapped) when Red or Green records a refused run.
 var ErrRefused = errors.New("workflow: run refused")
+
+// ErrInvalidItemID is returned (wrapped) when an item ID or plan step is not
+// a safe identifier.
+var ErrInvalidItemID = errors.New("workflow: invalid item id")
+
+var idRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// validateID rejects identifiers that could escape a path or confuse a
+// lookup: id must match ^[A-Za-z0-9][A-Za-z0-9._-]*$ and contain no "..".
+// Callers validate before any file or exec access.
+func validateID(id string) error {
+	if !idRe.MatchString(id) || strings.Contains(id, "..") {
+		return fmt.Errorf("%w: %q", ErrInvalidItemID, id)
+	}
+	return nil
+}
+
+// validateIDs validates each id with validateID.
+func validateIDs(ids ...string) error {
+	for _, id := range ids {
+		if err := validateID(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func sha256Hex(b []byte) string {
 	sum := sha256.Sum256(b)
@@ -97,6 +124,9 @@ func testFilesSHA(dir string, testFiles []string) (string, error) {
 // "test passed before implementation" and ErrRefused is returned. Missing
 // test files, an empty argv or a runner error record nothing.
 func Red(env GateEnv, r Runner, itemID, planStep, dir string, argv []string, testFiles []string) (TDDRun, error) {
+	if err := validateIDs(itemID, planStep); err != nil {
+		return TDDRun{}, err
+	}
 	if len(argv) == 0 || argv[0] == "" {
 		return TDDRun{}, errors.New("workflow: red needs a command")
 	}
@@ -132,21 +162,26 @@ func Red(env GateEnv, r Runner, itemID, planStep, dir string, argv []string, tes
 	return run, refused
 }
 
-// Green re-runs the argv of the latest verified red for planStep in dir. It
+// Green re-runs the argv of the latest (last appended) gtb-verified red for
+// planStep in dir. It
 // records refused (and returns ErrRefused) without running the command when
 // the red's test files changed or disappeared, and refused when the command
 // still fails; otherwise it records a verified green.
 func Green(env GateEnv, r Runner, itemID, planStep, dir string) (TDDRun, error) {
+	if err := validateIDs(itemID, planStep); err != nil {
+		return TDDRun{}, err
+	}
 	runs, err := env.Store.TDD(itemID)
 	if err != nil {
 		return TDDRun{}, err
 	}
+	// The latest red is the last matching row in store (append) order, not
+	// the greatest At.
 	var red *TDDRun
-	for i := range runs {
-		x := runs[i]
-		if x.PlanStep == planStep && x.Phase == phaseRed && x.Provenance == provenanceVerified && x.Source == sourceGTB &&
-			(red == nil || !x.At.Before(red.At)) {
+	for i := len(runs) - 1; i >= 0; i-- {
+		if x := runs[i]; x.PlanStep == planStep && x.Phase == phaseRed && isVerifiedTDD(x) {
 			red = &runs[i]
+			break
 		}
 	}
 	if red == nil {
@@ -259,13 +294,36 @@ func (t *tailWriter) Write(p []byte) (int, error) {
 
 // tailOf returns the last tailBytes bytes of b, advanced to the next rune
 // start so a multi-byte UTF-8 rune is never split.
-func tailOf(b []byte) string {
-	if len(b) <= tailBytes {
-		return string(b)
+func tailOf(b []byte) string { return lastBytes(string(b), tailBytes) }
+
+// lastBytes returns the longest suffix of s of at most n bytes that starts
+// on a rune boundary.
+func lastBytes(s string, n int) string {
+	if n <= 0 {
+		return ""
 	}
-	start := len(b) - tailBytes
-	for start < len(b) && !utf8.RuneStart(b[start]) {
+	if len(s) <= n {
+		return s
+	}
+	start := len(s) - n
+	for start < len(s) && !utf8.RuneStart(s[start]) {
 		start++
 	}
-	return string(b[start:])
+	return s[start:]
+}
+
+// firstBytes returns the longest prefix of s of at most n bytes that ends
+// on a rune boundary.
+func firstBytes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	end := n
+	for end > 0 && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	return s[:end]
 }

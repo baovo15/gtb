@@ -181,13 +181,22 @@ const (
 	changesRequestedOld                 // as above, but the artifact was revised since
 )
 
+// isHumanDecision reports whether a counts as a human decision: both the
+// role and the recording source must be human (defence in depth against
+// rows written outside HumanApprove).
+func isHumanDecision(a Approval) bool { return a.Role == roleHuman && a.Source == sourceHuman }
+
+// isVerifiedTDD reports whether r is TDD evidence gtb itself produced.
+func isVerifiedTDD(r TDDRun) bool { return r.Source == sourceGTB && r.Provenance == provenanceVerified }
+
 // humanDecision classifies the latest human decision on artifact name (by
 // At, the last appended winning ties) against the current sha. Only
-// Role=="human" records with verdict approve, reject or request_changes count.
+// isHumanDecision records with verdict approve, reject or request_changes
+// count.
 func humanDecision(name, sha string, approvals []Approval) decision {
 	var decisions []Approval
 	for _, a := range approvals {
-		if a.Artifact != name || a.Role != roleHuman {
+		if a.Artifact != name || !isHumanDecision(a) {
 			continue
 		}
 		switch a.Verdict {
@@ -379,12 +388,12 @@ func (g *gateCtx) tddOrdered() ([]TDDRun, bool) {
 	return runs, true
 }
 
-// redThenGreen reports whether planStep has a verified red followed later
-// by a verified green in runs (sorted by At).
+// redThenGreen reports whether planStep has a gtb-verified red followed
+// later by a gtb-verified green in runs (sorted by At).
 func redThenGreen(runs []TDDRun, planStep string) bool {
 	red := false
 	for _, r := range runs {
-		if r.PlanStep != planStep || r.Provenance != "verified" {
+		if r.PlanStep != planStep || !isVerifiedTDD(r) {
 			continue
 		}
 		switch r.Phase {
@@ -438,7 +447,7 @@ func (g *gateCtx) verifyGate() {
 	}
 	want := CheckCommandsSHA(g.cfg.CheckCommands)
 	for _, c := range checks {
-		if c.Passed && c.CmdSetSHA == want && !c.At.Before(g.entered) {
+		if c.Source == sourceGTB && c.Passed && c.CmdSetSHA == want && !c.At.Before(g.entered) {
 			return
 		}
 	}
@@ -451,7 +460,7 @@ func (g *gateCtx) reproduceGate() {
 		return
 	}
 	for _, r := range runs {
-		if r.PlanStep == reproStep && r.Phase == "red" && r.Provenance == "verified" {
+		if r.PlanStep == reproStep && r.Phase == "red" && isVerifiedTDD(r) {
 			return
 		}
 	}

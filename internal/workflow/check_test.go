@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestCheck_UnapprovedRefused(t *testing.T) {
@@ -65,5 +66,51 @@ func TestCheck_StopsAtFirstFailure(t *testing.T) {
 	}
 	if cs, _ := env.Store.Checks("it-1"); len(cs) != 1 || cs[0].Passed {
 		t.Fatalf("stored = %+v", cs)
+	}
+}
+
+func TestCheck_FailingTailCapped(t *testing.T) {
+	for _, tc := range []struct {
+		name, cmd string
+		keepsOut  bool
+	}{
+		// 908-byte command: prefix fits, output end fills the rest.
+		{"long command", "go test " + strings.Repeat("é", 450), true},
+		// 1409-byte command: the command prefix alone uses the budget.
+		{"command over budget", "go test " + strings.Repeat("é", 700), false},
+		{"short command", "go test ./...", true},
+	} {
+		env, dir := tddEnv(t)
+		approvedChecks(env, tc.cmd)
+		out := strings.Repeat("x", 1) + strings.Repeat("ü", 499) + "!" // 1000 bytes, ends with "!"
+		r := &fakeRunner{results: []fakeResult{{exit: 1, tail: out}}}
+		c, err := Check(env, r, "it-1", dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(c.Tail) > 1000 || !utf8.ValidString(c.Tail) || c.Passed {
+			t.Fatalf("%s: len %d valid %v", tc.name, len(c.Tail), utf8.ValidString(c.Tail))
+		}
+		if !strings.HasPrefix(c.Tail, tc.cmd[:min(len(tc.cmd), 100)]) || strings.HasSuffix(c.Tail, "!") != tc.keepsOut {
+			t.Fatalf("%s: tail must keep command prefix and output end: %q...%q", tc.name, c.Tail[:20], c.Tail[len(c.Tail)-5:])
+		}
+	}
+}
+
+func TestCapTail(t *testing.T) {
+	if got := capTail("cmd", "out"); got != "cmd\nout" {
+		t.Fatalf("short = %q", got)
+	}
+	got := capTail(strings.Repeat("c", 400), strings.Repeat("o", 1000))
+	if len(got) != 1000 || !strings.HasPrefix(got, strings.Repeat("c", 400)+"\n") {
+		t.Fatalf("len %d", len(got))
+	}
+	got = capTail(strings.Repeat("ç", 800), "OUT")
+	if len(got) != 1000 || !utf8.ValidString(got) || !strings.HasPrefix(got, "ççç") || strings.Contains(got, "OUT") {
+		t.Fatalf("long cmd: len %d %q", len(got), got[len(got)-6:])
+	}
+	got = capTail("c", strings.Repeat("ü", 600))
+	if len(got) != 1000 || !utf8.ValidString(got) || !strings.HasPrefix(got, "c\n") {
+		t.Fatalf("odd budget: len %d", len(got))
 	}
 }

@@ -101,7 +101,17 @@ func addApproval(t *testing.T, env GateEnv, id, name, verdict, role string, at t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := env.Store.AddApproval(Approval{ItemID: id, Artifact: name, SHA: sha, Verdict: verdict, Role: role, Actor: "a", At: at}); err != nil {
+	source := "agent"
+	if role == "human" {
+		source = "human"
+	}
+	addApprovalFrom(t, env, Approval{ItemID: id, Artifact: name, SHA: sha, Verdict: verdict, Role: role, Source: source, Actor: "a", At: at})
+}
+
+// addApprovalFrom records a exactly as given (for forged-source tests).
+func addApprovalFrom(t *testing.T, env GateEnv, a Approval) {
+	t.Helper()
+	if err := env.Store.AddApproval(a); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -113,7 +123,7 @@ func approve(t *testing.T, env GateEnv, id, name string) {
 
 func addTDD(t *testing.T, env GateEnv, id, step, phase, prov string, at time.Time) {
 	t.Helper()
-	if err := env.Store.AddTDD(TDDRun{ItemID: id, PlanStep: step, Phase: phase, Provenance: prov, At: at}); err != nil {
+	if err := env.Store.AddTDD(TDDRun{ItemID: id, PlanStep: step, Phase: phase, Source: "gtb", Provenance: prov, At: at}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -329,7 +339,7 @@ func TestGate_TaskExecute(t *testing.T) {
 
 func checkPass(at time.Time) func(t *testing.T, env GateEnv, it *Item) {
 	return func(t *testing.T, env GateEnv, it *Item) {
-		must(t, env.Store.AddCheck(CheckRun{ItemID: it.ID, CmdSetSHA: CheckCommandsSHA(testChecks), Passed: true, At: at}))
+		must(t, env.Store.AddCheck(CheckRun{ItemID: it.ID, Source: "gtb", CmdSetSHA: CheckCommandsSHA(testChecks), Passed: true, At: at}))
 	}
 }
 
@@ -342,10 +352,10 @@ func TestGate_Verify(t *testing.T) {
 		{name: "fix fresh pass", kind: KindFix, step: "verify", passed: true, setup: checkPass(time.Time{})},
 		{name: "no check", kind: KindTask, step: "verify", reasonSub: "no passing check since entering verify"},
 		{name: "failed check", kind: KindFix, step: "verify", reasonSub: "no passing check since entering verify", setup: func(t *testing.T, env GateEnv, it *Item) {
-			must(t, env.Store.AddCheck(CheckRun{ItemID: it.ID, CmdSetSHA: CheckCommandsSHA(testChecks), Passed: false, At: now}))
+			must(t, env.Store.AddCheck(CheckRun{ItemID: it.ID, Source: "gtb", CmdSetSHA: CheckCommandsSHA(testChecks), Passed: false, At: now}))
 		}},
 		{name: "stale command set", kind: KindTask, step: "verify", reasonSub: "no passing check since entering verify", setup: func(t *testing.T, env GateEnv, it *Item) {
-			must(t, env.Store.AddCheck(CheckRun{ItemID: it.ID, CmdSetSHA: "other", Passed: true, At: now}))
+			must(t, env.Store.AddCheck(CheckRun{ItemID: it.ID, Source: "gtb", CmdSetSHA: "other", Passed: true, At: now}))
 		}},
 		{name: "checks not approved", kind: KindTask, step: "verify", waiting: "approve check commands", reasonSub: "check commands not approved", setup: func(t *testing.T, env GateEnv, it *Item) {
 			checkPass(now)(t, env, it)
@@ -643,4 +653,43 @@ func TestGate_EpicTasks_BeadOnlyDoneNotCounted(t *testing.T) {
 	must(t, err)
 	must(t, env.Items.SetStep(c.ID, StepDone, time.Now()))
 	assertGate(t, Gate(env, epic), false, "", "child "+c.ID+" has no transition history, not done")
+}
+
+func TestGate_HumanRoleWithAgentSourceIgnored(t *testing.T) {
+	env := newTestEnv(t)
+	it := newItemAt(t, env, KindTask, "spec", time.Now())
+	writeArtifact(t, env, it.ID, "spec", "body\n")
+	_, sha, _, err := ReadArtifact(ArtifactPath(env.TownRoot, env.Rig, it.ID, "spec"))
+	must(t, err)
+	addApprovalFrom(t, env, Approval{ItemID: it.ID, Artifact: "spec", SHA: sha, Verdict: "approve", Role: "human", Source: "agent", Actor: "nux", At: time.Now()})
+	assertGate(t, Gate(env, it), false, "approve spec", "spec.md not approved")
+}
+
+func TestGate_AgentSourcedTDDIgnored(t *testing.T) {
+	forged := func(t *testing.T, env GateEnv, id, step, phase string, at time.Time) {
+		must(t, env.Store.AddTDD(TDDRun{ItemID: id, PlanStep: step, Phase: phase, Source: "agent", Provenance: "verified", At: at}))
+	}
+	base := time.Now().Add(-time.Minute)
+	runGateCases(t, []gateCase{
+		{name: "execute", kind: KindTask, step: "execute", reasonSub: "plan step a has no verified red then green", setup: func(t *testing.T, env GateEnv, it *Item) {
+			writeArtifact(t, env, it.ID, "plan", "---\nsteps: a\n---\nplan\n")
+			approve(t, env, it.ID, "plan")
+			forged(t, env, it.ID, "a", "red", base)
+			forged(t, env, it.ID, "a", "green", base.Add(time.Second))
+		}},
+		{name: "reproduce", kind: KindFix, step: "reproduce", reasonSub: "no verified red for repro", setup: func(t *testing.T, env GateEnv, it *Item) {
+			forged(t, env, it.ID, "repro", "red", base)
+		}},
+		{name: "fix", kind: KindFix, step: "fix", reasonSub: "repro has no verified red then green", setup: func(t *testing.T, env GateEnv, it *Item) {
+			forged(t, env, it.ID, "repro", "red", base)
+			forged(t, env, it.ID, "repro", "green", base.Add(time.Second))
+		}},
+	})
+}
+
+func TestGate_AgentSourcedCheckIgnored(t *testing.T) {
+	env := newTestEnv(t)
+	it := newItemAt(t, env, KindTask, "verify", time.Time{})
+	must(t, env.Store.AddCheck(CheckRun{ItemID: it.ID, Source: "agent", Provenance: "verified", CmdSetSHA: CheckCommandsSHA(testChecks), Passed: true}))
+	assertGate(t, Gate(env, it), false, "", "no passing check since entering verify")
 }

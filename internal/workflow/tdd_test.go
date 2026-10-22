@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -270,5 +271,78 @@ func TestTail_TrimsAtRuneBoundary(t *testing.T) {
 func TestOutputDir(t *testing.T) {
 	if got, want := OutputDir("/t", "r", "it-1"), filepath.Join("/t", "r", ".gtb", "items", "it-1", "outputs"); got != want {
 		t.Fatalf("OutputDir = %s, want %s", got, want)
+	}
+}
+
+var badIDs = []string{"../../x", "..", "a..b", "", "-x", ".x", "a/b", "a b", "a\\b"}
+
+func TestValidateID(t *testing.T) {
+	for _, id := range badIDs {
+		if err := validateID(id); !errors.Is(err, ErrInvalidItemID) {
+			t.Errorf("validateID(%q) = %v, want ErrInvalidItemID", id, err)
+		}
+	}
+	for _, id := range []string{"it-1", "gt-abc.1", "A_b", "1", "repro"} {
+		if err := validateID(id); err != nil {
+			t.Errorf("validateID(%q) = %v", id, err)
+		}
+	}
+}
+
+func TestInvalidIDs_RejectedBeforeAccess(t *testing.T) {
+	env, dir := tddEnv(t)
+	approvedChecks(env, "true")
+	r := &fakeRunner{results: []fakeResult{{exit: 1}}}
+	for _, bad := range []string{"../../x", "a..b"} {
+		if _, err := Red(env, r, bad, "1", dir, testArgv, testFileList); !errors.Is(err, ErrInvalidItemID) {
+			t.Errorf("Red item %q: %v", bad, err)
+		}
+		if _, err := Red(env, r, "it-1", bad, dir, testArgv, testFileList); !errors.Is(err, ErrInvalidItemID) {
+			t.Errorf("Red step %q: %v", bad, err)
+		}
+		if _, err := Green(env, r, bad, "1", dir); !errors.Is(err, ErrInvalidItemID) {
+			t.Errorf("Green item %q: %v", bad, err)
+		}
+		if _, err := Green(env, r, "it-1", bad, dir); !errors.Is(err, ErrInvalidItemID) {
+			t.Errorf("Green step %q: %v", bad, err)
+		}
+		if _, err := Check(env, r, bad, dir); !errors.Is(err, ErrInvalidItemID) {
+			t.Errorf("Check %q: %v", bad, err)
+		}
+		if _, err := HumanApprove(env, &fakeTerminal{tty: true, answer: true}, noEnv, bad, "spec", "approve", "me"); !errors.Is(err, ErrInvalidItemID) {
+			t.Errorf("HumanApprove %q: %v", bad, err)
+		}
+		if _, err := RecordVerdict(env, bad, "spec", "reviewer", "approve", "nux"); !errors.Is(err, ErrInvalidItemID) {
+			t.Errorf("RecordVerdict %q: %v", bad, err)
+		}
+	}
+	if len(r.calls) != 0 {
+		t.Fatalf("runner called %d times for invalid ids", len(r.calls))
+	}
+	if runs, _ := env.Store.TDD("it-1"); len(runs) != 0 {
+		t.Fatalf("stored = %+v", runs)
+	}
+}
+
+func TestGreen_LatestRedByStoreOrder(t *testing.T) {
+	env, dir := tddEnv(t)
+	sha, err := testFilesSHA(dir, testFileList)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, _ := cleanTestFiles(testFileList)
+	add := func(cmd string, at time.Time) {
+		if err := env.Store.AddTDD(TDDRun{ItemID: "it-1", PlanStep: "1", Phase: "red", Cmd: cmd, Exit: 1, TestFilesSHA: sha, TestFiles: files, Source: "gtb", Provenance: "verified", At: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add(`["first"]`, fixedNow)
+	add(`["second"]`, fixedNow.Add(-time.Hour)) // appended later, earlier At
+	r := &fakeRunner{results: []fakeResult{{exit: 0}}}
+	if _, err := Green(env, r, "it-1", "1", dir); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(r.calls[0].argv, []string{"second"}) {
+		t.Fatalf("green ran %v, want the last appended red", r.calls[0].argv)
 	}
 }
