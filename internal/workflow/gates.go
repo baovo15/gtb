@@ -99,6 +99,15 @@ func effectiveStep(env GateEnv, it *Item) (step Step, entered time.Time, history
 	return last.To, last.At, true, nil
 }
 
+// CurrentStep returns item it's current step as the gates see it (see
+// effectiveStep) and whether the store has transition history for it.
+// Callers outside the gates must not trust a step without history unless it
+// is the kind's first step.
+func CurrentStep(env GateEnv, it *Item) (step Step, history bool, err error) {
+	step, _, history, err = effectiveStep(env, it)
+	return step, history, err
+}
+
 // firstStep returns the first step of kind k, or "" for an unknown kind.
 func firstStep(k Kind) Step {
 	if steps := stepTables[k]; len(steps) > 0 {
@@ -221,6 +230,14 @@ func humanDecision(name, sha string, approvals []Approval) decision {
 	}
 }
 
+// HumanApprovedCurrent reports whether the latest human decision on artifact
+// name approves sha (the artifact's current hash). Only records with
+// Role=="human" and Source=="human" count; a later request_changes or reject,
+// or an approval of an older sha, means false.
+func HumanApprovedCurrent(name, sha string, approvals []Approval) bool {
+	return humanDecision(name, sha, approvals) == approvedCurrent
+}
+
 // approved is the step artifact gate: artifact name must be human-approved
 // at its current sha. A newer request_changes or reject blocks, and also
 // waits for a human when the artifact has been revised since that request.
@@ -326,10 +343,8 @@ func Gate(env GateEnv, it *Item) GateResult {
 		g.fixGate()
 	case it.Kind == KindTask && step == "review":
 		if haveA {
-			switch unquote(fm["bump"]) {
-			case "patch", "minor", "major":
-			default:
-				g.fail("review.md must set bump: patch|minor|major")
+			if _, err := ReviewBump(fm); err != nil {
+				g.fail("%v", err)
 			}
 		}
 	case it.Kind == KindEpic && step == "breakdown":

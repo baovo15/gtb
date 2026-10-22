@@ -224,6 +224,42 @@ func (e *Engineer) ProcessBatch(ctx context.Context, batch []*MRInfo, target str
 		return e.processSingleMR(ctx, batch[0], target)
 	}
 
+	// Gated workflow items merge only through the single-MR path, where the
+	// refinery merge gate (review, version bump, PR CI) runs. Process them
+	// one at a time and batch the rest.
+	var rest []*MRInfo
+	for _, mr := range batch {
+		if !e.mrIsGated(mr) {
+			rest = append(rest, mr)
+			continue
+		}
+		r := e.processSingleMR(ctx, mr, target)
+		result.Merged = append(result.Merged, r.Merged...)
+		result.Culprits = append(result.Culprits, r.Culprits...)
+		result.Conflicts = append(result.Conflicts, r.Conflicts...)
+		if r.MergeCommit != "" {
+			result.MergeCommit = r.MergeCommit
+		}
+		if r.Error != nil && result.Error == nil {
+			result.Error = r.Error
+		}
+	}
+	if len(rest) < len(batch) {
+		if len(rest) > 0 {
+			r := e.ProcessBatch(ctx, rest, target, batchCfg)
+			result.Merged = append(result.Merged, r.Merged...)
+			result.Culprits = append(result.Culprits, r.Culprits...)
+			result.Conflicts = append(result.Conflicts, r.Conflicts...)
+			if r.MergeCommit != "" {
+				result.MergeCommit = r.MergeCommit
+			}
+			if r.Error != nil && result.Error == nil {
+				result.Error = r.Error
+			}
+		}
+		return result
+	}
+
 	_, _ = fmt.Fprintf(e.output, "[Batch] Processing batch of %d MRs targeting %s\n", len(batch), target)
 	if !e.recheckBatchEligibility(batch, target, result) {
 		return result
