@@ -732,8 +732,27 @@ func (s *Store) MarkDelivered(machineID string, keys []string) error {
 // PendingRequests returns the machine's pending or delivered requests that
 // have not expired at now and have no result, oldest first.
 func (s *Store) PendingRequests(machineID string, now time.Time) ([]agentlink.Request, error) {
+	rows, err := s.pendingRequestRows(machineID, now)
+	if err != nil {
+		return nil, err
+	}
+	var out []agentlink.Request
+	for _, r := range rows {
+		out = append(out, r.Request)
+	}
+	return out, nil
+}
+
+// pendingRequestRow is a PendingRequests entry with its status (pending or
+// delivered), which the wire type does not carry.
+type pendingRequestRow struct {
+	agentlink.Request
+	Status string
+}
+
+func (s *Store) pendingRequestRows(machineID string, now time.Time) ([]pendingRequestRow, error) {
 	rows, err := s.db.Query(`
-		SELECT r.key, r.type, r.item_id, r.params, r.expires_at FROM requests r
+		SELECT r.key, r.type, r.item_id, r.params, r.expires_at, r.status FROM requests r
 		WHERE r.machine_id = ? AND r.status IN (?, ?) AND r.expires_at > ?
 		  AND NOT EXISTS (SELECT 1 FROM results x WHERE x.machine_id = r.machine_id AND x.key = r.key)
 		ORDER BY r.created_at, r.key`,
@@ -742,12 +761,12 @@ func (s *Store) PendingRequests(machineID string, now time.Time) ([]agentlink.Re
 		return nil, fmt.Errorf("server: pending requests: %w", err)
 	}
 	defer rows.Close()
-	var out []agentlink.Request
+	var out []pendingRequestRow
 	for rows.Next() {
-		var r agentlink.Request
+		var r pendingRequestRow
 		var params sql.NullString
 		var exp int64
-		if err := rows.Scan(&r.Key, &r.Type, &r.ItemID, &params, &exp); err != nil {
+		if err := rows.Scan(&r.Key, &r.Type, &r.ItemID, &params, &exp, &r.Status); err != nil {
 			return nil, fmt.Errorf("server: pending requests: %w", err)
 		}
 		if params.Valid {

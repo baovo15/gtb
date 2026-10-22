@@ -696,3 +696,100 @@ func TestResults_Over500_413(t *testing.T) {
 	}
 	wantError(t, f.do(http.MethodPost, "/agent/v1/results", tok, rs), http.StatusRequestEntityTooLarge, "too_many_results")
 }
+
+// deliver polls once without waiting so the machine's pending requests become
+// delivered.
+func (f *apiFixture) deliver(tok string, want int) {
+	f.t.Helper()
+	if got := decode[[]agentlink.Request](f.t, f.do(http.MethodGet, "/agent/v1/requests", tok, nil)); len(got) != want {
+		f.t.Fatalf("deliver: got %d requests, want %d", len(got), want)
+	}
+}
+
+// R33: delivered-but-unanswered requests do not end the wait, so the agent
+// cannot hot-loop; they are re-delivered when the wait ends.
+func TestRequests_DeliveredOnlyWaits(t *testing.T) {
+	f := newAPIFixture(t)
+	tok := f.machine("m1")
+	f.api.maxWait = 300 * time.Millisecond
+	f.api.recheck = 50 * time.Millisecond // rechecks must not end the wait either
+	f.enqueue("m1", "k1", time.Hour)
+	f.deliver(tok, 1)
+
+	start := time.Now()
+	rec := f.do(http.MethodGet, "/agent/v1/requests?wait=10s", tok, nil)
+	el := time.Since(start)
+	wantStatus(t, rec, http.StatusOK)
+	if el < 280*time.Millisecond {
+		t.Fatalf("returned after %v; delivered-only poll must wait ~300ms", el)
+	}
+	if el > 2*time.Second {
+		t.Fatalf("returned after %v, want about 300ms", el)
+	}
+	if got := decode[[]agentlink.Request](t, rec); len(got) != 1 || got[0].Key != "k1" {
+		t.Fatalf("re-delivery = %+v", got)
+	}
+}
+
+func TestRequests_NewPendingReturnsAllImmediately(t *testing.T) {
+	f := newAPIFixture(t)
+	tok := f.machine("m1")
+	f.api.maxWait = 5 * time.Second
+	f.enqueue("m1", "k1", time.Hour)
+	f.deliver(tok, 1)
+	f.clock.Advance(time.Millisecond) // k2 sorts after k1 by created_at
+	f.enqueue("m1", "k2", time.Hour)
+
+	start := time.Now()
+	rec := f.do(http.MethodGet, "/agent/v1/requests?wait=5s", tok, nil)
+	if el := time.Since(start); el > time.Second {
+		t.Fatalf("returned after %v, want immediately", el)
+	}
+	got := decode[[]agentlink.Request](t, rec)
+	if len(got) != 2 || got[0].Key != "k1" || got[1].Key != "k2" {
+		t.Fatalf("requests = %+v, want [k1 k2]", got)
+	}
+}
+
+func TestRequests_DeliveredOnlyWokenByEnqueue(t *testing.T) {
+	f := newAPIFixture(t)
+	tok := f.machine("m1")
+	f.api.recheck = time.Hour
+	f.enqueue("m1", "k1", time.Hour)
+	f.deliver(tok, 1)
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	start := time.Now()
+	go func() { done <- f.do(http.MethodGet, "/agent/v1/requests?wait=20s", tok, nil) }()
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case rec := <-done:
+		t.Fatalf("delivered-only poll returned early: %s", rec.Body.String())
+	default:
+	}
+	if err := f.store.EnqueueRequest("m1", agentlink.Request{Key: "k2", Type: "inspect", ExpiresAt: time.Now().Add(48 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case rec := <-done:
+		if el := time.Since(start); el > time.Second {
+			t.Fatalf("woke after %v, want < 1s", el)
+		}
+		got := decode[[]agentlink.Request](t, rec)
+		if len(got) != 2 {
+			t.Fatalf("requests = %+v, want k1 and k2", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("enqueue did not wake the delivered-only poll")
+	}
+}
+
+func TestRequests_NonPositiveRecheckNoPanic(t *testing.T) {
+	f := newAPIFixture(t)
+	tok := f.machine("m1")
+	f.api.maxWait = 50 * time.Millisecond
+	for _, rc := range []time.Duration{0, -time.Second} {
+		f.api.recheck = rc
+		wantStatus(t, f.do(http.MethodGet, "/agent/v1/requests?wait=1s", tok, nil), http.StatusOK)
+	}
+}

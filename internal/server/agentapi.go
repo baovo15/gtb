@@ -214,6 +214,16 @@ func (a *AgentAPI) events(w http.ResponseWriter, r *http.Request, m *Machine) {
 	}
 }
 
+// hasUndelivered reports whether any row is still pending (not yet delivered).
+func hasUndelivered(rows []pendingRequestRow) bool {
+	for _, r := range rows {
+		if r.Status == RequestPending {
+			return true
+		}
+	}
+	return false
+}
+
 // effectiveWait is min(wait, maxWait).
 func (a *AgentAPI) effectiveWait(wait time.Duration) time.Duration {
 	return min(wait, a.maxWait)
@@ -221,11 +231,18 @@ func (a *AgentAPI) effectiveWait(wait time.Duration) time.Duration {
 
 // requests: GET /agent/v1/requests?wait=<duration>, returns []Request.
 //
-// It returns at once if the machine has pending requests. Otherwise it waits
-// until a request is enqueued for the machine, the wait (capped at maxWait)
-// elapses, or the client goes away. No database handle is held while
+// It returns at once if the machine has at least one request still in status
+// pending. Requests that were already delivered but have no result do not end
+// the wait (R33): otherwise every poll would return at once and the agent
+// would spin against the database until they expired. It waits until a
+// request is enqueued for the machine, the wait (capped at maxWait) elapses,
+// or the client goes away, then returns the full set, re-deliveries included,
+// so a lost response is still re-delivered. No database handle is held while
 // waiting. Returned requests are marked delivered; they stay deliverable
 // until they have a result or expire.
+//
+// Contract (Task 14): the agent posts a Result for every delivered request it
+// receives, including ones it drops, so delivered requests do not linger.
 func (a *AgentAPI) requests(w http.ResponseWriter, r *http.Request, m *Machine) {
 	var wait time.Duration
 	if s := r.URL.Query().Get("wait"); s != "" {
@@ -242,34 +259,41 @@ func (a *AgentAPI) requests(w http.ResponseWriter, r *http.Request, m *Machine) 
 	wake, unsubscribe := a.store.notifier.subscribe(m.ID)
 	defer unsubscribe()
 
-	reqs, err := a.store.PendingRequests(m.ID, a.now())
+	rows, err := a.store.pendingRequestRows(m.ID, a.now())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal")
 		return
 	}
-	if len(reqs) == 0 && wait > 0 {
+	if !hasUndelivered(rows) && wait > 0 {
+		recheck := a.recheck
+		if recheck <= 0 {
+			recheck = defaultRecheck
+		}
 		timer := time.NewTimer(wait)
 		defer timer.Stop()
-		ticker := time.NewTicker(a.recheck)
+		ticker := time.NewTicker(recheck)
 		defer ticker.Stop()
-	poll:
-		for len(reqs) == 0 {
+		for timedOut := false; !timedOut; {
 			select {
 			case <-r.Context().Done():
 				return // client gone; nothing to deliver
 			case <-timer.C:
-				break poll
+				timedOut = true // re-read once more: return the current full set
 			case <-wake:
 			case <-ticker.C:
 			}
-			if reqs, err = a.store.PendingRequests(m.ID, a.now()); err != nil {
+			if rows, err = a.store.pendingRequestRows(m.ID, a.now()); err != nil {
 				writeError(w, http.StatusInternalServerError, "internal")
 				return
 			}
+			if hasUndelivered(rows) {
+				break
+			}
 		}
 	}
-	if reqs == nil {
-		reqs = []agentlink.Request{}
+	reqs := make([]agentlink.Request, len(rows))
+	for i, row := range rows {
+		reqs[i] = row.Request
 	}
 	keys := make([]string, len(reqs))
 	for i, q := range reqs {
