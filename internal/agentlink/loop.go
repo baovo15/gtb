@@ -5,6 +5,7 @@ package agentlink
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -18,6 +19,15 @@ const (
 	// MaxBatch is the most events per POST /events and results per POST
 	// /results the server accepts.
 	MaxBatch = 500
+
+	// Body budgets, below the server's limits (8 MiB for snapshot and
+	// events, 1 MiB for results) with room for the JSON envelope.
+	maxEventsBody   = 7 << 20
+	maxSnapshotBody = 7 << 20
+	maxResultsBody  = 900 << 10
+
+	// ErrCodeTooLarge replaces a result too large to post.
+	ErrCodeTooLarge = "too_large"
 
 	defaultPollWait   = 30 * time.Second
 	defaultHeartbeat  = 30 * time.Second
@@ -219,8 +229,15 @@ func (l *loop) session(ctx context.Context) (progressed bool, err error) {
 	}
 }
 
-// flush sends every pending event in batches of MaxBatch, acking the cursor
-// the server returns after each batch. A 409 sets l.resync and returns nil.
+// flush sends every pending event in batches of at most MaxBatch events and
+// maxEventsBody bytes, acking the cursor the server returns after each batch.
+// A 409 sets l.resync and returns nil.
+//
+// A batch the server refuses as malformed or too large (400, 413), and a
+// single event larger than the body budget, can never be delivered; retrying
+// would wedge the queue. Such events are dropped with a log line, acked
+// locally, and the loop resyncs: the snapshot carries the machine's state,
+// so only the dropped events themselves are lost.
 func (l *loop) flush(ctx context.Context) error {
 	for {
 		after, err := l.q.Cursor()
@@ -234,21 +251,56 @@ func (l *loop) flush(ctx context.Context) error {
 		if len(evs) == 0 {
 			return nil
 		}
+		evs = fitEvents(evs)
+		if len(evs) == 1 && jsonSize(evs[0]) > maxEventsBody {
+			return l.drop(evs, "larger than the request body limit")
+		}
 		cursor, err := l.c.events(ctx, after, evs)
-		if errors.Is(err, errResync) {
+		var ae *apiError
+		switch {
+		case errors.Is(err, errResync):
 			l.resync = true
 			return nil
-		}
-		if err != nil {
+		case errors.As(err, &ae) && (ae.Status == http.StatusBadRequest || ae.Status == http.StatusRequestEntityTooLarge):
+			return l.drop(evs, fmt.Sprintf("refused by the server (%d %s)", ae.Status, ae.Code))
+		case err != nil:
 			return err
 		}
 		if err := l.q.Ack(cursor); err != nil {
 			return err
 		}
-		if len(evs) < MaxBatch {
-			return nil
+	}
+}
+
+// drop acks evs locally without delivering them and schedules a resync.
+func (l *loop) drop(evs []Event, why string) error {
+	l.logf("agentlink: dropped %d event(s) %s..%s: %s", len(evs), evs[0].ID, evs[len(evs)-1].ID, why)
+	if err := l.q.Ack(evs[len(evs)-1].ID); err != nil {
+		return err
+	}
+	l.resync = true
+	return nil
+}
+
+// fitEvents returns the longest prefix of evs (at least one event) whose
+// encoding fits maxEventsBody.
+func fitEvents(evs []Event) []Event {
+	total := 0
+	for i, e := range evs {
+		total += jsonSize(e) + 1
+		if total > maxEventsBody && i > 0 {
+			return evs[:i]
 		}
 	}
+	return evs
+}
+
+func jsonSize(v any) int {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return 0
+	}
+	return len(b)
 }
 
 // sendSnapshot collects and posts a snapshot (see Run for the cursor rule).
@@ -278,9 +330,26 @@ func (l *loop) sendSnapshot(ctx context.Context) error {
 		return fmt.Errorf("agentlink: collect snapshot: %w", err)
 	}
 	snap.Cursor = last
+	// A snapshot over the body budget is sent without artifacts, which
+	// follow as artifact events (each artifact is capped by the collector).
+	var deferred []Event
+	if jsonSize(snap) > maxSnapshotBody {
+		items := make([]ItemView, len(snap.Items))
+		for i, iv := range snap.Items {
+			for _, a := range iv.Artifacts {
+				b, _ := json.Marshal(a)
+				deferred = append(deferred, Event{Type: EventArtifact, ItemID: iv.ID, Data: b})
+			}
+			iv.Artifacts = nil
+			items[i] = iv
+		}
+		snap.Items = items
+		l.logf("agentlink: snapshot too large; sending %d artifacts as events", len(deferred))
+	}
 	if err := l.c.snapshot(ctx, snap); err != nil {
 		return err
 	}
+	keep = append(keep, deferred...)
 	for _, e := range keep {
 		e.Data = append(e.Data[:0:0], e.Data...)
 		if err := l.q.Append(e); err != nil {
@@ -305,7 +374,15 @@ func (l *loop) handle(ctx context.Context, reqs []Request) error {
 		results = append(results, l.apply(ctx, r))
 	}
 	for len(results) > 0 {
-		n := min(len(results), MaxBatch)
+		n, size := 0, 2
+		for n < len(results) && n < MaxBatch {
+			sz := jsonSize(results[n]) + 1
+			if n > 0 && size+sz > maxResultsBody {
+				break
+			}
+			size += sz
+			n++
+		}
 		if err := l.c.results(ctx, results[:n]); err != nil {
 			return err
 		}
@@ -326,6 +403,10 @@ func (l *loop) apply(ctx context.Context, r Request) Result {
 	}
 	res := l.safeApply(ctx, r)
 	res.Key = r.Key
+	if jsonSize(res) > maxResultsBody {
+		l.logf("agentlink: result of request %s (%s) is too large to post", r.Key, r.Type)
+		res = Fail(r.Key, ErrCodeTooLarge)
+	}
 	if err := l.applied.Put(res); err != nil {
 		l.logf("agentlink: record applied request %s: %v", r.Key, err)
 	}

@@ -515,3 +515,108 @@ func TestAgentLoop_HeartbeatAndScan(t *testing.T) {
 	})
 	stop()
 }
+
+// Bodies are kept under the server's limits (8 MiB snapshot/events, 1 MiB
+// results), otherwise a 413 would wedge the loop forever.
+func TestAgentLoop_LargeSnapshotAndResultsAreSplit(t *testing.T) {
+	f := newLoopFixture(t)
+	f.now = time.Now().UTC()
+	big := strings.Repeat("a", 200<<10)
+	var items []agentlink.ItemView // ~12 MiB of artifacts
+	for i := 0; i < 60; i++ {
+		items = append(items, agentlink.ItemView{ID: fmt.Sprintf("it-%d", i), Rig: "r", Kind: "task", Step: "spec",
+			Artifacts: []agentlink.ArtifactView{{Name: "spec", SHA: fmt.Sprintf("sha%d", i), Content: big}}})
+	}
+	cfg := f.config(&countingApplier{fn: func(r agentlink.Request) agentlink.Result {
+		return agentlink.Result{Key: r.Key, OK: true, Data: json.RawMessage(`{"x":"` + strings.Repeat("b", 400<<10) + `"}`)}
+	}}, &logBuf{})
+	cfg.Collect = func() (agentlink.Snapshot, error) { return agentlink.Snapshot{Items: items}, nil }
+	for i := 0; i < 4; i++ { // ~1.6 MiB of results
+		enqueue(t, f, agentlink.Request{Key: fmt.Sprintf("k%d", i), Type: "inspect", ItemID: "it-1", ExpiresAt: f.now.Add(time.Hour)})
+	}
+	q := agentlink.OpenQueue(f.town)
+	stop := run(t, cfg)
+	eventually(t, "all delivered", func() bool {
+		for i := 0; i < 4; i++ {
+			if resultFor(t, f, fmt.Sprintf("k%d", i)) == nil {
+				return false
+			}
+		}
+		m, _ := f.store.Machine(testMachine)
+		p, _ := q.Pending(1)
+		return m.HasSnapshot && len(p) == 0
+	})
+	stop()
+	for _, id := range []string{"it-0", "it-59"} {
+		_, arts, err := f.store.Item(testMachine, id)
+		if err != nil || len(arts) != 1 || len(arts[0].Content) != len(big) {
+			t.Fatalf("%s artifacts = %d %v", id, len(arts), err)
+		}
+	}
+	if r := resultFor(t, f, "k3"); !r.OK {
+		t.Fatalf("k3 = %+v", r)
+	}
+}
+
+func TestAgentLoop_LargeEventBacklogIsSplit(t *testing.T) {
+	f := newLoopFixture(t)
+	f.store.ApplySnapshot(testMachine, agentlink.Snapshot{})
+	big := strings.Repeat("a", 200<<10)
+	q := agentlink.OpenQueue(f.town)
+	for i := 0; i < 45; i++ { // ~9 MiB of events
+		id := fmt.Sprintf("it-%d", i)
+		e := agentlink.Event{Type: agentlink.EventItemUpsert, ItemID: id}
+		e.Data, _ = json.Marshal(agentlink.ItemView{ID: id, Rig: "r", Kind: "task", Step: "spec",
+			Artifacts: []agentlink.ArtifactView{{Name: "spec", SHA: fmt.Sprintf("new%d", i), Content: big}}})
+		q.Append(e)
+	}
+	stop := run(t, f.config(&countingApplier{}, &logBuf{}))
+	eventually(t, "drained", func() bool { p, _ := q.Pending(1); return len(p) == 0 })
+	stop()
+	f.mu.Lock()
+	n, snaps := len(f.accepted), f.snapshots
+	f.mu.Unlock()
+	if n != 45 || snaps != 0 {
+		t.Fatalf("accepted %d events, %d snapshots", n, snaps)
+	}
+	if _, arts, _ := f.store.Item(testMachine, "it-44"); len(arts) != 1 || arts[0].SHA != "new44" {
+		t.Fatalf("it-44 artifact = %+v", arts)
+	}
+}
+
+// A result too large to post is replaced by a too_large failure.
+func TestAgentLoop_OversizedResult(t *testing.T) {
+	f := newLoopFixture(t)
+	f.now = time.Now().UTC()
+	enqueue(t, f, agentlink.Request{Key: "k-big", Type: "inspect", ItemID: "x", ExpiresAt: f.now.Add(time.Hour)})
+	stop := run(t, f.config(&countingApplier{fn: func(r agentlink.Request) agentlink.Result {
+		return agentlink.Result{Key: r.Key, OK: true, Data: json.RawMessage(`"` + strings.Repeat("c", 2<<20) + `"`)}
+	}}, &logBuf{}))
+	eventually(t, "result", func() bool { return resultFor(t, f, "k-big") != nil })
+	stop()
+	if r := resultFor(t, f, "k-big"); r.OK || r.Error != "too_large" {
+		t.Fatalf("result = %+v", r)
+	}
+}
+
+// An event the server refuses as invalid (400) must not wedge the queue:
+// the batch is dropped with a log line and later events still flow.
+func TestAgentLoop_RejectedBatchDoesNotWedge(t *testing.T) {
+	f := newLoopFixture(t)
+	f.store.ApplySnapshot(testMachine, agentlink.Snapshot{})
+	q := agentlink.OpenQueue(f.town)
+	q.Append(agentlink.Event{Type: "bogus", ItemID: "x", Data: json.RawMessage(`{}`)})
+	logs := &logBuf{}
+	stop := run(t, f.config(&countingApplier{}, logs))
+	eventually(t, "queue drained", func() bool { p, _ := q.Pending(1); return len(p) == 0 })
+	q.Append(upsert("good"))
+	eventually(t, "good event", func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return len(f.accepted) == 1
+	})
+	stop()
+	if !strings.Contains(logs.String(), "dropped 1 event") {
+		t.Fatalf("log = %s", logs.String())
+	}
+}
