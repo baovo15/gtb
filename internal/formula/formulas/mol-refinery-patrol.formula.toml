@@ -108,7 +108,7 @@ When `await-event` outputs `EFFORT: full`, run all steps thoroughly (normal mode
 
 The goal: idle cycles should burn ~10% of the tokens a full patrol uses."""
 formula = "mol-refinery-patrol"
-version = 17
+version = 18
 
 [vars]
 [vars.wisp_type]
@@ -647,7 +647,11 @@ MR open, skip to loop-check); on exit 5 the item went back to execute — treat
 as rejected; on exit 1 do not merge. `gt mq post-merge` refuses a gated MR that
 did not pass the gate.
 
-**If merge_strategy = "direct" (default):**
+**If merge_strategy = "direct" (default):** this path is NEVER used for a gated
+item. A gated item (one whose source issue is a gtb workflow item) always takes
+the PR path below: `gtb mq gate`, then `gh pr merge`, then `gt mq post-merge`,
+never a direct `git merge` or push to the target, even when merge_strategy is
+"direct". Direct merge applies only to non-gated MRs.
 
 ```bash
 git checkout <merge-target>
