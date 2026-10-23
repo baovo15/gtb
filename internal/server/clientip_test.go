@@ -39,6 +39,19 @@ func TestClientIP(t *testing.T) {
 		{"empty XFF entry", "10.1.2.3:4000", []string{"198.51.100.4, , 10.0.0.1"}, "10.1.2.3"},
 		{"ipv6 client", "10.1.2.3:4000", []string{"2001:db8::1"}, "2001:db8::1"},
 		{"ipv4-mapped peer", "[::ffff:10.1.2.3]:4000", []string{"198.51.100.4"}, "198.51.100.4"},
+		// R42: entries left of the first untrusted one are client-controlled
+		// and never looked at, so a junk prefix cannot escape the bucket.
+		{"junk left of client", "10.1.2.3:4000", []string{"x, 198.51.100.4"}, "198.51.100.4"},
+		{"unknown left of client", "10.1.2.3:4000", []string{"unknown, 198.51.100.4"}, "198.51.100.4"},
+		{"junk left of client past trusted", "10.1.2.3:4000", []string{"x, 198.51.100.4, 10.0.0.9"}, "198.51.100.4"},
+		{"ipv4 with port", "10.1.2.3:4000", []string{"198.51.100.4:5678"}, "198.51.100.4"},
+		{"bracketed ipv6 with port", "10.1.2.3:4000", []string{"[2001:db8::1]:443"}, "2001:db8::1"},
+		{"bracketed ipv6", "10.1.2.3:4000", []string{"[2001:db8::2]"}, "2001:db8::2"},
+		{"mapped client unmapped", "10.1.2.3:4000", []string{"::ffff:198.51.100.6"}, "198.51.100.6"},
+		{"garbage right-most", "10.1.2.3:4000", []string{"198.51.100.4, garbage"}, "10.1.2.3"},
+		{"unknown right-most", "10.1.2.3:4000", []string{"198.51.100.4, unknown"}, "10.1.2.3"},
+		{"mapped untrusted peer", "[::ffff:203.0.113.9]:4000", []string{"1.2.3.4"}, "203.0.113.9"},
+		{"mapped peer, all trusted", "[::ffff:10.1.2.3]:4000", []string{"10.0.0.5"}, "10.1.2.3"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -52,6 +65,29 @@ func TestClientIP(t *testing.T) {
 			}
 		})
 	}
+	// Mapped and unmapped forms of one peer share a key.
+	for _, tr := range [][]netip.Prefix{nil, trusted} {
+		a := httptest.NewRequest(http.MethodGet, "/", nil)
+		a.RemoteAddr = "[::ffff:203.0.113.20]:1"
+		b := httptest.NewRequest(http.MethodGet, "/", nil)
+		b.RemoteAddr = "203.0.113.20:2"
+		if ka, kb := clientIP(a, tr), clientIP(b, tr); ka != kb || ka != "203.0.113.20" {
+			t.Fatalf("mapped %q vs unmapped %q", ka, kb)
+		}
+	}
+
+	// A 4-in-6 trusted CIDR matches an IPv4 peer and IPv4 XFF hops.
+	t46 := mustPrefixes(t, "::ffff:10.0.0.0/104")
+	if len(t46) != 1 || !t46[0].Addr().Is4() || t46[0].Bits() != 8 {
+		t.Fatalf("4-in-6 prefix = %v", t46)
+	}
+	r46 := httptest.NewRequest(http.MethodGet, "/", nil)
+	r46.RemoteAddr = "10.2.3.4:1"
+	r46.Header.Set("X-Forwarded-For", "198.51.100.9, 10.0.0.7")
+	if got := clientIP(r46, t46); got != "198.51.100.9" {
+		t.Fatalf("4-in-6 trusted: %q", got)
+	}
+
 	// No trusted proxies: XFF is never read.
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	r.RemoteAddr = "10.1.2.3:1"
@@ -66,7 +102,7 @@ func TestParseTrustedProxies(t *testing.T) {
 	if err != nil || len(ps) != 3 {
 		t.Fatalf("ps = %v, %v", ps, err)
 	}
-	for _, bad := range []string{"10.0.0.0/33", "nope", "10.0.0/8"} {
+	for _, bad := range []string{"10.0.0.0/33", "nope", "10.0.0/8", "::ffff:10.0.0.0/90"} {
 		if _, err := ParseTrustedProxies([]string{bad}); err == nil || !strings.Contains(err.Error(), bad) {
 			t.Fatalf("%q: err = %v", bad, err)
 		}
@@ -103,6 +139,30 @@ func TestLoginLimiter_SeparateBucketsBehindProxy(t *testing.T) {
 	}
 	if code := loginXFF(f, testAdminToken, "198.51.100.2"); code != http.StatusOK {
 		t.Fatalf("client 2 limited by client 1: %d", code)
+	}
+}
+
+func TestLoginLimiter_JunkXFFStaysInOwnBucket(t *testing.T) {
+	f := newProxiedFixture(t)
+	// nginx appends the real client to whatever the client sent.
+	for i := 0; i < 10; i++ {
+		if code := loginXFF(f, "wrong", "x, 198.51.100.50"); code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: %d", i, code)
+		}
+	}
+	if code := loginXFF(f, testAdminToken, "198.51.100.50"); code != http.StatusTooManyRequests {
+		t.Fatalf("junk-prefixed client escaped its bucket: %d", code)
+	}
+	if code := loginXFF(f, testAdminToken, "unknown, 198.51.100.50"); code != http.StatusTooManyRequests {
+		t.Fatalf("unknown-prefixed client escaped its bucket: %d", code)
+	}
+	// The shared proxy bucket (the peer's key) was never charged.
+	req := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{"token":"`+testAdminToken+`"}`))
+	req.RemoteAddr = "10.0.0.1:5555"
+	rec := httptest.NewRecorder()
+	f.app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("proxy bucket charged: %d", rec.Code)
 	}
 }
 

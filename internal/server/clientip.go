@@ -11,7 +11,9 @@ import (
 
 // ParseTrustedProxies parses CIDRs (or bare IPs, as /32 or /128) of reverse
 // proxies whose X-Forwarded-For is trusted. Blank entries are skipped. An
-// invalid entry is an error naming it.
+// invalid entry is an error naming it. A 4-in-6 prefix such as
+// ::ffff:10.0.0.0/104 becomes the equivalent IPv4 prefix (10.0.0.0/8), since
+// addresses are unmapped before matching.
 func ParseTrustedProxies(cidrs []string) ([]netip.Prefix, error) {
 	var out []netip.Prefix
 	for _, c := range cidrs {
@@ -20,6 +22,12 @@ func ParseTrustedProxies(cidrs []string) ([]netip.Prefix, error) {
 			continue
 		}
 		if p, err := netip.ParsePrefix(c); err == nil {
+			if p.Addr().Is4In6() {
+				if p.Bits() < 96 {
+					return nil, fmt.Errorf("invalid trusted proxy %q: a 4-in-6 prefix needs at least /96", c)
+				}
+				p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+			}
 			out = append(out, p.Masked())
 			continue
 		}
@@ -34,7 +42,6 @@ func ParseTrustedProxies(cidrs []string) ([]netip.Prefix, error) {
 }
 
 func isTrusted(a netip.Addr, trusted []netip.Prefix) bool {
-	a = a.Unmap()
 	for _, p := range trusted {
 		if p.Contains(a) {
 			return true
@@ -43,37 +50,53 @@ func isTrusted(a netip.Addr, trusted []netip.Prefix) bool {
 	return false
 }
 
-// clientIP returns the client address for rate limiting (R41). It is the
-// immediate peer (RemoteAddr without port) unless that peer is a trusted
-// proxy; then X-Forwarded-For is walked right to left and the first entry
-// that is not itself trusted wins. A missing or malformed header, or one
-// whose entries are all trusted, falls back to the peer. X-Forwarded-For
-// from an untrusted peer is never read.
+// parseHostAddr parses an address as it appears in RemoteAddr or an
+// X-Forwarded-For entry: optional surrounding space, optional [...] and an
+// optional :port ("1.2.3.4:5678", "[2001:db8::1]:443", "[2001:db8::1]",
+// "2001:db8::1"). The result is unmapped, so ::ffff:a.b.c.d and a.b.c.d are
+// the same key. "unknown" and anything else unparseable fail.
+func parseHostAddr(s string) (netip.Addr, bool) {
+	s = strings.TrimSpace(s)
+	if ap, err := netip.ParseAddrPort(s); err == nil {
+		return ap.Addr().Unmap(), true
+	}
+	s = strings.TrimSuffix(strings.TrimPrefix(s, "["), "]")
+	a, err := netip.ParseAddr(s)
+	if err != nil || a.Zone() != "" {
+		return netip.Addr{}, false
+	}
+	return a.Unmap(), true
+}
+
+// clientIP returns the client address for rate limiting (R41, amended by
+// R42). It is the immediate peer (RemoteAddr, normalised by parseHostAddr)
+// unless that peer is a trusted proxy. Then X-Forwarded-For entries are
+// walked right to left, each parsed only when reached: trusted entries are
+// skipped and the first untrusted, parseable entry is the client. Entries to
+// its left are client-controlled and never examined. The peer is returned
+// when a malformed entry (or "unknown") is reached before any untrusted one,
+// or when every entry is trusted or there are none. X-Forwarded-For from an
+// untrusted peer is never read.
 func clientIP(r *http.Request, trusted []netip.Prefix) string {
-	peer := remoteIP(r.RemoteAddr)
-	if len(trusted) == 0 {
+	pa, ok := parseHostAddr(r.RemoteAddr)
+	if !ok {
+		return remoteIP(r.RemoteAddr)
+	}
+	peer := pa.String()
+	if len(trusted) == 0 || !isTrusted(pa, trusted) {
 		return peer
 	}
-	pa, err := netip.ParseAddr(peer)
-	if err != nil || !isTrusted(pa, trusted) {
-		return peer
-	}
-	var entries []string
-	for _, v := range r.Header.Values("X-Forwarded-For") {
-		entries = append(entries, strings.Split(v, ",")...)
-	}
-	// Parse everything first: any malformed entry makes the header untrustworthy.
-	addrs := make([]netip.Addr, 0, len(entries))
-	for _, e := range entries {
-		a, err := netip.ParseAddr(strings.TrimSpace(e))
-		if err != nil {
-			return peer
-		}
-		addrs = append(addrs, a.Unmap())
-	}
-	for i := len(addrs) - 1; i >= 0; i-- {
-		if !isTrusted(addrs[i], trusted) {
-			return addrs[i].String()
+	vals := r.Header.Values("X-Forwarded-For")
+	for i := len(vals) - 1; i >= 0; i-- {
+		entries := strings.Split(vals[i], ",")
+		for j := len(entries) - 1; j >= 0; j-- {
+			a, ok := parseHostAddr(entries[j])
+			if !ok {
+				return peer
+			}
+			if !isTrusted(a, trusted) {
+				return a.String()
+			}
 		}
 	}
 	return peer

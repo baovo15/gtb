@@ -535,7 +535,7 @@ These are the likely failure modes that no task's main tests cover. Each one has
   - `GET /agent/v1/requests?wait=30s` long-polls with `wait` capped at 30 s. It returns `[]Request` without expired ones.
   - `POST /agent/v1/results` with body `[]Result`.
   - `POST /agent/v1/heartbeat`.
-- `func NewAgentAPI(st *Store, now func() time.Time) http.Handler`.
+- `func NewAgentAPI(st *Store, now func() time.Time, trusted ...netip.Prefix) http.Handler`. `trusted` lists reverse proxies whose `X-Forwarded-For` identifies the client for the enroll limiter (R41/R42, Task 15).
 
 - [ ] **Step 1: Write the failing tests** with `httptest`:
   - `TestEvents_Over500_413`.
