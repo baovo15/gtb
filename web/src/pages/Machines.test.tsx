@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderAt } from "../test/render";
 import { mockFetch } from "../test/mocks";
@@ -20,5 +20,16 @@ describe("Machines", () => {
     expect(calls.some((c) => c.method === "DELETE")).toBe(false);
     await userEvent.click(screen.getByRole("button", { name: "Confirm revoke box-one" }));
     await waitFor(() => expect(calls.find((c) => c.method === "DELETE")?.headers.get("X-CSRF-Token")).toBe("tok"));
+  });
+
+  it("ages machine freshness on the client", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    mockFetch({ "GET /api/v1/machines": { body: [{ ...m, freshness_seconds: 100 }] } });
+    renderAt("/machines");
+    expect(await screen.findByText("1m ago")).toBeInTheDocument();
+    await act(async () => {
+      vi.advanceTimersByTime(25_000);
+    });
+    expect(screen.getByText("stale")).toBeInTheDocument();
   });
 });

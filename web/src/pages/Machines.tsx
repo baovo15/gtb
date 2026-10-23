@@ -95,7 +95,7 @@ export function Machines() {
                     <td className="py-2 pr-4 font-mono">{m.gtb_version || "—"}</td>
                     <td className="py-2 pr-4">
                       <span className="flex items-center gap-2">
-                        <Freshness seconds={m.freshness_seconds} stale={m.stale} />
+                        <Freshness seconds={m.freshness_seconds} fetchedAt={machines.fetchedAt} />
                         <span className="text-xs text-zinc-500">{formatTime(m.last_seen_at)}</span>
                       </span>
                     </td>

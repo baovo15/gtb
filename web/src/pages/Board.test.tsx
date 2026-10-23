@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { screen, within, waitFor } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { act, screen, within, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderAt } from "../test/render";
 import { item, mockFetch, MockEventSource } from "../test/mocks";
@@ -18,7 +18,7 @@ function setup(board: unknown) {
 
 describe("Board", () => {
   it("puts Needs you first with its empty state, and marks stale cards", async () => {
-    setup({ lanes: [{ step: "spec", items: [item({ id: "gt-7", stale: true, freshness_seconds: 999 })] }, { step: "plan", items: [item({ id: "gt-8", step: "plan", freshness_seconds: 125 })] }], needs_you: [] });
+    setup({ lanes: [{ step: "spec", items: [item({ id: "gt-7", stale: true, freshness_seconds: 999 })] }, { step: "plan", items: [item({ id: "gt-8", step: "plan", freshness_seconds: 100 })] }], needs_you: [] });
     renderAt("/");
     const headings = await screen.findAllByRole("heading", { level: 2 });
     expect(headings.map((h) => h.textContent?.replace(/\d+$/, "").trim())).toEqual(["Needs you", "spec", "plan"]);
@@ -26,7 +26,7 @@ describe("Board", () => {
     const stale = screen.getByRole("link", { name: /gt-7/ });
     expect(within(stale).getByText("stale")).toBeInTheDocument();
     const fresh = screen.getByRole("link", { name: /gt-8/ });
-    expect(within(fresh).getByText("2m ago")).toBeInTheDocument();
+    expect(within(fresh).getByText("1m ago")).toBeInTheDocument();
   });
 
   it("shows waiting reasons on Needs you cards and links cards to the item page", async () => {
@@ -68,5 +68,28 @@ describe("Board", () => {
     expect(MockEventSource.instances[0].url).toBe("/api/v1/events");
     MockEventSource.instances[0].emit("board.changed");
     await waitFor(() => expect(calls.filter((c) => c.path === "/api/v1/board").length).toBeGreaterThan(before));
+  });
+
+  describe("client-side freshness (R44)", () => {
+    it("turns a 110s card stale after 15s without a refetch, and revalidates every 60s", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const calls = setup({ lanes: [{ step: "spec", items: [item({ id: "gt-5", freshness_seconds: 110, stale: false })] }], needs_you: [] });
+      renderAt("/");
+      const card = await screen.findByRole("link", { name: /gt-5/ });
+      expect(within(card).getByText("1m ago")).toBeInTheDocument();
+      const boardCalls = () => calls.filter((c) => c.path === "/api/v1/board").length;
+      const before = boardCalls();
+
+      await act(async () => {
+        vi.advanceTimersByTime(15_000);
+      });
+      expect(within(screen.getByRole("link", { name: /gt-5/ })).getByText("stale")).toBeInTheDocument();
+      expect(boardCalls()).toBe(before);
+
+      await act(async () => {
+        vi.advanceTimersByTime(45_000);
+      });
+      await waitFor(() => expect(boardCalls()).toBeGreaterThan(before));
+    });
   });
 });

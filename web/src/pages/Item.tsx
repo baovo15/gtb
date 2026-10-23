@@ -1,4 +1,4 @@
-import { useMemo, type KeyboardEvent } from "react";
+import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 import { itemPath, useApi } from "../api";
 import { machineNames, useMachines } from "../App";
@@ -7,7 +7,7 @@ import { Freshness } from "../components/Freshness";
 import { Markdown } from "../components/Markdown";
 import { TerminalView } from "../components/TerminalView";
 import { Empty, InlineError, formatTime } from "../components/ui";
-import type { ItemDetail, ItemEvent } from "../types";
+import type { ArtifactView, ItemDetail, ItemEvent } from "../types";
 
 const TABS = [
   { id: "overview", label: "Overview" },
@@ -93,11 +93,38 @@ function Overview({ d }: { d: ItemDetail }) {
   );
 }
 
+// Artifacts pins the version of each artifact the user opened (name, sha,
+// content). A live refetch that brings a newer sha does not replace what is
+// on screen or what Approve posts: a banner offers to load it, and approving
+// the pinned sha gets stale_sha from the machine (R43). The component is
+// keyed by item, so pins never cross items.
 function Artifacts({ d, machine }: { d: ItemDetail; machine: string }) {
   const [params, setParams] = useSearchParams();
-  if (d.artifacts.length === 0) return <Empty>No artifacts yet.</Empty>;
-  const selName = params.get("artifact");
-  const sel = d.artifacts.find((a) => a.name === selName) ?? d.artifacts[0];
+  const [pins, setPins] = useState<Record<string, ArtifactView>>({});
+  const selName = params.get("artifact") ?? d.artifacts[0]?.name ?? "";
+  const latest = d.artifacts.find((a) => a.name === selName) ?? (params.get("artifact") ? undefined : d.artifacts[0]);
+  const pinned = pins[selName] ?? latest;
+
+  useEffect(() => {
+    if (latest && !pins[latest.name]) setPins((p) => (p[latest.name] ? p : { ...p, [latest.name]: latest }));
+  }, [latest, pins]);
+
+  if (!pinned) return <Empty>{d.artifacts.length === 0 ? "No artifacts yet." : `No artifact named ${selName}.`}</Empty>;
+  const newer = latest && latest.sha !== pinned.sha ? latest : null;
+
+  function open(a: ArtifactView) {
+    // Picking an artifact (again) re-pins it to the latest version.
+    setPins((p) => ({ ...p, [a.name]: a }));
+    setParams(
+      (p) => {
+        const n = new URLSearchParams(p);
+        n.set("artifact", a.name);
+        return n;
+      },
+      { replace: true },
+    );
+  }
+
   return (
     <div className="flex flex-col gap-4 md:flex-row">
       <ul aria-label="Artifacts" className="flex shrink-0 flex-row gap-1 md:w-40 md:flex-col">
@@ -105,16 +132,10 @@ function Artifacts({ d, machine }: { d: ItemDetail; machine: string }) {
           <li key={a.name}>
             <button
               type="button"
-              aria-pressed={a.name === sel.name}
-              onClick={() =>
-                setParams((p) => {
-                  const n = new URLSearchParams(p);
-                  n.set("artifact", a.name);
-                  return n;
-                }, { replace: true })
-              }
+              aria-pressed={a.name === pinned.name}
+              onClick={() => open(a)}
               className={`w-full rounded-md px-3 py-1.5 text-left font-mono text-sm focus-visible:outline-2 focus-visible:outline-teal-500 ${
-                a.name === sel.name ? "bg-zinc-200 dark:bg-zinc-800" : "hover:bg-zinc-100 dark:hover:bg-zinc-900"
+                a.name === pinned.name ? "bg-zinc-200 dark:bg-zinc-800" : "hover:bg-zinc-100 dark:hover:bg-zinc-900"
               }`}
             >
               {a.name}
@@ -123,9 +144,21 @@ function Artifacts({ d, machine }: { d: ItemDetail; machine: string }) {
         ))}
       </ul>
       <div className="flex min-w-0 flex-1 flex-col gap-3">
-        <ApproveBar machine={machine} itemId={d.item.id} artifact={sel} />
+        {newer && (
+          <div role="status" className="flex flex-wrap items-center gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+            <span>A newer version of {pinned.name} is on the machine.</span>
+            <button
+              type="button"
+              onClick={() => open(newer)}
+              className="rounded-md border border-amber-400 px-2.5 py-1 text-xs font-medium hover:bg-amber-100 focus-visible:outline-2 focus-visible:outline-teal-500 dark:border-amber-700 dark:hover:bg-amber-900"
+            >
+              Load it
+            </button>
+          </div>
+        )}
+        <ApproveBar key={`${pinned.name}@${pinned.sha}`} machine={machine} itemId={d.item.id} artifact={pinned} />
         <article className="rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
-          <Markdown source={sel.content} />
+          <Markdown source={pinned.content} />
         </article>
       </div>
     </div>
@@ -281,7 +314,7 @@ export function Item() {
             <div>
               <dt className="text-[11px] uppercase tracking-wide text-zinc-500">Freshness</dt>
               <dd>
-                <Freshness seconds={d.item.freshness_seconds} stale={d.item.stale} />
+                <Freshness seconds={d.item.freshness_seconds} fetchedAt={detail.fetchedAt} />
               </dd>
             </div>
           </dl>
@@ -316,7 +349,7 @@ export function Item() {
           </div>
           <div role="tabpanel" id={`panel-${tab}`} aria-labelledby={`tab-${tab}`} className="p-6">
             {tab === "overview" && <Overview d={d} />}
-            {tab === "artifacts" && <Artifacts d={d} machine={machine} />}
+            {tab === "artifacts" && <Artifacts key={`${machine}/${id}`} d={d} machine={machine} />}
             {tab === "evidence" && <Evidence d={d} />}
             {tab === "logs" && <Logs d={d} />}
             {tab === "files" && <Files d={d} />}

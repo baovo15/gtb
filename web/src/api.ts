@@ -127,6 +127,8 @@ export function onRevalidate(fn: () => void): () => void {
 interface ApiState<T> {
   key: string | null;
   data?: T;
+  // fetchedAt is when data arrived (Date.now()).
+  fetchedAt?: number;
   error?: unknown;
   loading: boolean;
 }
@@ -144,8 +146,10 @@ export function useApi<T>(path: string | null) {
     const ctl = new AbortController();
     setState((s) => (s.key === path ? { ...s, loading: true } : { key: path, loading: true }));
     api<T>(path, { signal: ctl.signal }).then(
-      (data) => live && setState({ key: path, data, loading: false }),
-      (error) => live && setState((s) => ({ key: path, data: s.key === path ? s.data : undefined, error, loading: false })),
+      (data) => live && setState({ key: path, data, fetchedAt: Date.now(), loading: false }),
+      (error) =>
+        live &&
+        setState((s) => (s.key === path ? { ...s, error, loading: false } : { key: path, error, loading: false })),
     );
     return () => {
       live = false;
@@ -155,6 +159,7 @@ export function useApi<T>(path: string | null) {
   const mine = state.key === path;
   return {
     data: mine ? state.data : undefined,
+    fetchedAt: mine ? state.fetchedAt : undefined,
     error: mine ? state.error : undefined,
     loading: !mine || state.loading,
     reload,

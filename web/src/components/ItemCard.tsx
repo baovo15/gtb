@@ -16,7 +16,7 @@ export function itemHref(it: { machine_id: string; id: string }) {
   return `/items/${encodeURIComponent(it.machine_id)}/${encodeURIComponent(it.id)}`;
 }
 
-export function ItemCard({ item, machineName, showWaiting }: { item: ItemRow; machineName: string; showWaiting?: boolean }) {
+export function ItemCard({ item, machineName, fetchedAt, showWaiting }: { item: ItemRow; machineName: string; fetchedAt: number | undefined; showWaiting?: boolean }) {
   return (
     <Link
       to={itemHref(item)}
@@ -28,7 +28,7 @@ export function ItemCard({ item, machineName, showWaiting }: { item: ItemRow; ma
           {item.kind}
         </span>
         <span className="ml-auto">
-          <Freshness seconds={item.freshness_seconds} stale={item.stale} />
+          <Freshness seconds={item.freshness_seconds} fetchedAt={fetchedAt} />
         </span>
       </div>
       <p className="text-sm leading-snug text-zinc-800 dark:text-zinc-200">{item.title}</p>

@@ -1,4 +1,4 @@
-import { NavLink, Outlet, type RouteObject } from "react-router";
+import { Link, NavLink, Outlet, type RouteObject } from "react-router";
 import { api, useApi } from "./api";
 import { useBoardEvents } from "./events";
 import { ToastProvider, useToast } from "./components/Toast";
@@ -92,14 +92,24 @@ function Root() {
   );
 }
 
-function NotFound() {
-  return <p className="p-6 text-sm text-zinc-500">Page not found.</p>;
+// NotFound is the catch-all page and the root errorElement, so users never
+// see React Router's developer error screen.
+export function NotFound() {
+  return (
+    <div className="flex min-h-screen flex-col items-center justify-center gap-3 bg-white p-6 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
+      <h1 className="text-lg font-semibold">Not found</h1>
+      <Link to="/" className="text-sm text-teal-700 underline focus-visible:outline-2 focus-visible:outline-teal-500 dark:text-teal-400">
+        Back to the board
+      </Link>
+    </div>
+  );
 }
 
 export const routes: RouteObject[] = [
   {
     path: "/",
     element: <Root />,
+    errorElement: <NotFound />,
     children: [
       { index: true, element: <Board /> },
       { path: "items/:machine/:id", element: <Item /> },

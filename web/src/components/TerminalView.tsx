@@ -1,63 +1,77 @@
 // TerminalView shows a peek of the item's worker terminal. It refreshes on
-// demand and every timing.terminalMs while the page is visible; requests
-// never overlap (the server may wait for the machine).
-import { useCallback, useEffect, useRef, useState } from "react";
+// demand and every timing.terminalMs while the page is visible. Each effect
+// run (one machine/item) owns an AbortController: unmounting or switching
+// items aborts the in-flight peek, and a response from an earlier run never
+// writes state or reschedules. Peeks within one run never overlap (the
+// server may wait for the machine).
+import { useEffect, useRef, useState } from "react";
 import { api, errorText, itemPath, timing } from "../api";
 
-export function TerminalView({ machine, itemId }: { machine: string; itemId: string }) {
-  const [lines, setLines] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const inflight = useRef(false);
-  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const alive = useRef(true);
+interface View {
+  lines: string | null;
+  error: string | null;
+  busy: boolean;
+}
 
-  const refresh = useCallback(async () => {
-    if (inflight.current) return;
-    inflight.current = true;
-    setBusy(true);
-    clearTimeout(timer.current);
-    try {
-      const res = await api<{ lines: string }>(`${itemPath(machine, itemId)}/terminal`);
-      if (!alive.current) return;
-      setLines(res.lines);
-      setError(null);
-    } catch (e) {
-      if (!alive.current) return;
-      setError(errorText(e));
-    } finally {
-      inflight.current = false;
-      if (alive.current) {
-        setBusy(false);
-        if (document.visibilityState === "visible") {
-          timer.current = setTimeout(() => void refresh(), timing.terminalMs);
-        }
-      }
-    }
-  }, [machine, itemId]);
+export function TerminalView({ machine, itemId }: { machine: string; itemId: string }) {
+  const [view, setView] = useState<View>({ lines: null, error: null, busy: false });
+  const refreshRef = useRef<() => void>(() => {});
 
   useEffect(() => {
-    alive.current = true;
-    void refresh();
+    const ctl = new AbortController();
+    const { signal } = ctl;
+    let inflight = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    setView({ lines: null, error: null, busy: false });
+
+    const schedule = () => {
+      clearTimeout(timer);
+      if (!signal.aborted && document.visibilityState === "visible") {
+        timer = setTimeout(() => void refresh(), timing.terminalMs);
+      }
+    };
+
+    async function refresh() {
+      if (inflight || signal.aborted) return;
+      inflight = true;
+      clearTimeout(timer);
+      setView((v) => ({ ...v, busy: true }));
+      try {
+        const res = await api<{ lines: string }>(`${itemPath(machine, itemId)}/terminal`, { signal });
+        if (signal.aborted) return;
+        setView({ lines: res.lines, error: null, busy: false });
+      } catch (e) {
+        if (signal.aborted) return;
+        setView((v) => ({ ...v, error: errorText(e), busy: false }));
+      } finally {
+        inflight = false;
+      }
+      schedule();
+    }
+
     const onVis = () => {
       if (document.visibilityState === "visible") void refresh();
-      else clearTimeout(timer.current);
+      else clearTimeout(timer);
     };
+    refreshRef.current = () => void refresh();
     document.addEventListener("visibilitychange", onVis);
+    void refresh();
     return () => {
-      alive.current = false;
-      clearTimeout(timer.current);
+      ctl.abort();
+      clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVis);
+      refreshRef.current = () => {};
     };
-  }, [refresh]);
+  }, [machine, itemId]);
 
+  const { lines, error, busy } = view;
   return (
     <div className="flex flex-col gap-2">
       <div className="flex items-center gap-3">
         <button
           type="button"
           aria-label="Refresh terminal"
-          onClick={() => void refresh()}
+          onClick={() => refreshRef.current()}
           disabled={busy}
           className="rounded-md border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-100 focus-visible:outline-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:border-zinc-700 dark:hover:bg-zinc-800"
         >

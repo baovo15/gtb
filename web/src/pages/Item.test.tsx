@@ -3,7 +3,7 @@ import { act, screen, waitFor } from "@testing-library/react";
 import { timing } from "../api";
 import userEvent from "@testing-library/user-event";
 import { renderAt } from "../test/render";
-import { item, mockFetch, SHA, type Handler } from "../test/mocks";
+import { item, mockFetch, MockEventSource, SHA, type Handler, type Reply } from "../test/mocks";
 
 function detail() {
   return {
@@ -17,7 +17,7 @@ function detail() {
   };
 }
 
-function setup(result: unknown, extra: Record<string, Handler | { status?: number; body?: unknown }> = {}) {
+function setup(result: unknown, extra: Record<string, Handler | Reply> = {}) {
   return mockFetch({
     "GET /api/v1/me": { body: { login: "admin", csrf_token: "tok-9" } },
     "GET /api/v1/machines": { body: [] },
@@ -43,28 +43,24 @@ describe("Item", () => {
     expect(await screen.findByText("Approved")).toBeInTheDocument();
   });
 
-  it("shows the reload message on a stale_sha result, and keeps it after the refetch", async () => {
-    const NEW = "c".repeat(64);
-    let fetches = 0;
-    setup({ status: "done", result: { ok: false, error: "stale_sha" } }, {
-      "GET /api/v1/items/m1/gt-1": () => {
-        const d = detail();
-        if (fetches++ > 0) d.artifacts[0].sha = NEW;
-        return { body: d };
-      },
-    });
+  it("shows the reload message on a stale_sha result", async () => {
+    setup({ status: "done", result: { ok: false, error: "stale_sha" } });
     renderAt("/items/m1/gt-1?tab=artifacts");
     await userEvent.click(await screen.findByRole("button", { name: "Approve" }));
     expect(await screen.findByText("Artifact changed on the machine; reload to review the new version")).toBeInTheDocument();
-    expect(await screen.findByText(NEW.slice(0, 12))).toBeInTheDocument();
-    await act(() => new Promise((r) => setTimeout(r, 50)));
-    expect(screen.getByText("Artifact changed on the machine; reload to review the new version")).toBeInTheDocument();
   });
 
   it("shows the expired message on an expired request", async () => {
     setup({ status: "expired", result: null });
     renderAt("/items/m1/gt-1?tab=artifacts");
     await userEvent.click(await screen.findByRole("button", { name: "Request changes" }));
+    expect(await screen.findByText("Request expired; the machine was offline")).toBeInTheDocument();
+  });
+
+  it("maps a machine-reported expired error to the expired message", async () => {
+    setup({ status: "done", result: { ok: false, error: "expired" } });
+    renderAt("/items/m1/gt-1?tab=artifacts");
+    await userEvent.click(await screen.findByRole("button", { name: "Approve" }));
     expect(await screen.findByText("Request expired; the machine was offline")).toBeInTheDocument();
   });
 
@@ -145,5 +141,52 @@ describe("Item", () => {
     expect(await screen.findByRole("heading", { name: "Title" })).toBeInTheDocument();
     await waitFor(() => expect(container.querySelector("script")).toBeNull());
     expect(container.querySelector("[onerror]")).toBeNull();
+  });
+
+  describe("pinned artifact (R43)", () => {
+    const B = "c".repeat(64);
+    const banner = "A newer version of spec is on the machine.";
+
+    // The first item fetch has spec at SHA with "Version A"; later fetches
+    // have it at B with "Version B".
+    function setupVersions() {
+      let n = 0;
+      return setup({ status: "done", result: { ok: false, error: "stale_sha" } }, {
+        "GET /api/v1/items/m1/gt-1": () => {
+          const d = detail();
+          d.artifacts[0] = n++ === 0 ? { name: "spec", sha: SHA, content: "Version A" } : { name: "spec", sha: B, content: "Version B" };
+          return { body: d };
+        },
+      });
+    }
+
+    async function openAndRefetch() {
+      renderAt("/items/m1/gt-1?tab=artifacts");
+      expect(await screen.findByText("Version A")).toBeInTheDocument();
+      act(() => MockEventSource.instances[0].emit("board.changed"));
+      expect(await screen.findByText(banner)).toBeInTheDocument();
+    }
+
+    it("keeps the opened version and approves its sha after a refetch brings a newer one", async () => {
+      const calls = setupVersions();
+      await openAndRefetch();
+      expect(screen.getByText("Version A")).toBeInTheDocument();
+      expect(screen.queryByText("Version B")).toBeNull();
+      expect(screen.getByText(SHA.slice(0, 12))).toBeInTheDocument();
+      await userEvent.click(screen.getByRole("button", { name: "Approve" }));
+      expect(calls.find((c) => c.method === "POST")!.body).toEqual({ artifact: "spec", sha: SHA });
+      expect(await screen.findByText("Artifact changed on the machine; reload to review the new version")).toBeInTheDocument();
+      expect(screen.getByText(banner)).toBeInTheDocument();
+    });
+
+    it("re-pins to the latest version on Load it", async () => {
+      const calls = setupVersions();
+      await openAndRefetch();
+      await userEvent.click(screen.getByRole("button", { name: "Load it" }));
+      expect(await screen.findByText("Version B")).toBeInTheDocument();
+      expect(screen.queryByText(banner)).toBeNull();
+      await userEvent.click(screen.getByRole("button", { name: "Approve" }));
+      expect(calls.find((c) => c.method === "POST")!.body).toEqual({ artifact: "spec", sha: B });
+    });
   });
 });

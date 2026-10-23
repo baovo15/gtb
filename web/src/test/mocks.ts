@@ -1,9 +1,11 @@
 import { vi } from "vitest";
 
-export type Handler = (req: { url: URL; method: string; headers: Headers; body: unknown }) => {
+export interface Reply {
   status?: number;
   body?: unknown;
-};
+}
+
+export type Handler = (req: { url: URL; method: string; headers: Headers; body: unknown }) => Reply | Promise<Reply>;
 
 export interface Call {
   method: string;
@@ -12,21 +14,22 @@ export interface Call {
   headers: Headers;
   body: unknown;
   credentials?: RequestCredentials;
+  signal?: AbortSignal | null;
 }
 
 // mockFetch installs a fetch stub that routes "METHOD /path" (no query) to
 // handlers. Unknown routes answer 404 {"error":"not_found"}. It returns the
 // recorded calls.
-export function mockFetch(routes: Record<string, Handler | { status?: number; body?: unknown }>): Call[] {
+export function mockFetch(routes: Record<string, Handler | Reply>): Call[] {
   const calls: Call[] = [];
   const fn = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
     const url = new URL(String(input), "http://gtb.test");
     const method = (init.method ?? "GET").toUpperCase();
     const headers = new Headers(init.headers);
     const body = typeof init.body === "string" ? JSON.parse(init.body) : undefined;
-    calls.push({ method, path: url.pathname, search: url.search, headers, body, credentials: init.credentials });
+    calls.push({ method, path: url.pathname, search: url.search, headers, body, credentials: init.credentials, signal: init.signal });
     const route = routes[`${method} ${url.pathname}`];
-    const res = typeof route === "function" ? route({ url, method, headers, body }) : route ?? { status: 404, body: { error: "not_found" } };
+    const res = await (typeof route === "function" ? route({ url, method, headers, body }) : route ?? { status: 404, body: { error: "not_found" } });
     return new Response(res.body === undefined ? null : JSON.stringify(res.body), {
       status: res.status ?? 200,
       headers: { "Content-Type": "application/json" },

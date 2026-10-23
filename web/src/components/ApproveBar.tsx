@@ -1,5 +1,6 @@
 // ApproveBar approves, or requests changes on, exactly the artifact version
-// the user is looking at (its sha), then polls the request until the machine
+// the user is looking at (the pinned sha, never a newer refetched one), then
+// polls the request until the machine
 // answers, it expires, or 60 s pass.
 import { useEffect, useRef, useState } from "react";
 import { api, errorText, itemPath, pollRequest, revalidate, type Outcome } from "../api";
@@ -14,6 +15,7 @@ export function outcomeText(o: Outcome, action: "approve" | "request-changes"): 
   switch (o.kind) {
     case "done":
       if (o.ok) return { text: action === "approve" ? "Approved" : "Changes requested", tone: "ok" };
+      if (o.error === "expired") return { text: "Request expired; the machine was offline", tone: "warn" };
       if (o.error === "stale_sha") return { text: "Artifact changed on the machine; reload to review the new version", tone: "warn" };
       return { text: `Machine reported: ${o.error}`, tone: "error" };
     case "expired":
@@ -36,10 +38,8 @@ export function ApproveBar({ machine, itemId, artifact }: { machine: string; ite
   const [state, setState] = useState<State>({ kind: "idle" });
   const ctl = useRef<AbortController | null>(null);
   useEffect(() => () => ctl.current?.abort(), []);
-  // Switching artifacts is a fresh review. A new sha of the same artifact
-  // keeps the last message (e.g. the stale_sha reload hint stays visible
-  // after the refetch that brings the new version).
-  useEffect(() => setState({ kind: "idle" }), [artifact.name]);
+  // The parent keys this bar by artifact name and pinned sha, so a newly
+  // loaded version starts as a fresh review.
 
   async function act(action: "approve" | "request-changes") {
     ctl.current?.abort();

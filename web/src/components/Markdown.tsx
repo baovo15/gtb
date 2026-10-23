@@ -10,6 +10,8 @@ export function renderMarkdown(src: string): string {
 }
 
 export function Markdown({ source }: { source: string }) {
-  const html = useMemo(() => renderMarkdown(source), [source]);
-  return <div className="markdown" dangerouslySetInnerHTML={{ __html: html }} />;
+  // A stable object: the sanitized DOM is only replaced when the source
+  // changes, never on an unrelated re-render.
+  const inner = useMemo(() => ({ __html: renderMarkdown(source) }), [source]);
+  return <div className="markdown" dangerouslySetInnerHTML={inner} />;
 }
