@@ -174,6 +174,30 @@ func mqPostMergeGatedCheck(rigName, rigPath string, mr *refinery.MergeRequest) (
 	if last := ci[len(ci)-1]; !last.Passed || head == "" || last.Tail != refinery.CIHeadTail(head) {
 		return nil, refuse(fmt.Sprintf("latest CI evidence is not a pass for head %s", head))
 	}
+	// The pass must be recorded at or after the item's latest transition into
+	// merge: a pass from an earlier merge cycle does not count.
+	transitions, err := env.Store.Transitions(id)
+	if err != nil {
+		return nil, refuse(fmt.Sprintf("reading transitions: %v", err))
+	}
+	var mergedAt time.Time
+	for _, tr := range transitions {
+		if tr.To == "merge" {
+			mergedAt = tr.At
+		}
+	}
+	if mergedAt.IsZero() {
+		return nil, refuse("no transition into merge")
+	}
+	var freshPass bool
+	for _, c := range ci {
+		if c.Passed && c.Tail == refinery.CIHeadTail(head) && !c.At.IsZero() && !c.At.Before(mergedAt) {
+			freshPass = true
+		}
+	}
+	if !freshPass {
+		return nil, refuse(fmt.Sprintf("no CI pass for head %s recorded since the item entered merge", head))
+	}
 	if step == workflow.StepDone {
 		// A previous post-merge run recorded done; finish the cleanup.
 		return func() error { return nil }, nil

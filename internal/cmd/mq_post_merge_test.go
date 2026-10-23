@@ -40,6 +40,8 @@ type fakeMQPostMergeGit struct {
 	remoteTip string
 	localHead string
 	tipErr    error
+	prHead    string
+	lookupErr error
 
 	verifiedCommits []string
 	deletedBranches []string
@@ -58,6 +60,13 @@ func (g *fakeMQPostMergeGit) HasOpenPullRequest(git.PullRequestRef) bool {
 
 func (g *fakeMQPostMergeGit) PushRemoteBranchTip(_, _ string) (string, error) {
 	return g.remoteTip, g.tipErr
+}
+
+func (g *fakeMQPostMergeGit) LookupPullRequest(git.PullRequestRef) (*git.PullRequestInfo, error) {
+	if g.lookupErr != nil {
+		return nil, g.lookupErr
+	}
+	return &git.PullRequestInfo{Number: 1, State: "MERGED", HeadSHA: g.prHead}, nil
 }
 
 func (g *fakeMQPostMergeGit) Rev(string) (string, error) {

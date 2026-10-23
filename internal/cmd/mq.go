@@ -198,6 +198,7 @@ type mqPostMergeGit interface {
 	VerifyPushedCommitReachableFromPushTarget(remote, branch, commit string) error
 	PushRemoteBranchTip(remote, branch string) (string, error)
 	HasOpenPullRequest(ref git.PullRequestRef) bool
+	LookupPullRequest(ref git.PullRequestRef) (*git.PullRequestInfo, error)
 	Rev(ref string) (string, error)
 	DeleteRemoteBranchIfAt(remote, branch, expectedHash string) error
 	DeleteBranch(branch string, force bool) error
@@ -599,6 +600,9 @@ func runVerifiedMQPostMerge(mgr mqPostMergeManager, rigName, rigPath string, rig
 		return nil, mqPostMergeBranchCleanup{}, err
 	}
 	if recordDone != nil {
+		if err := verifyGatedMergedPRHead(rigGit, mr); err != nil {
+			return nil, mqPostMergeBranchCleanup{}, err
+		}
 		if err := recordDone(); err != nil {
 			return nil, mqPostMergeBranchCleanup{}, err
 		}
@@ -611,6 +615,28 @@ func runVerifiedMQPostMerge(mgr mqPostMergeManager, rigName, rigPath string, rig
 
 	branchCleanup, err := cleanupMQPostMergeBranch(rigPath, rigGit, result.MR, skipBranchDelete)
 	return result, branchCleanup, err
+}
+
+// verifyGatedMergedPRHead checks that the merged PR's head is the gated head
+// H (mr.CommitSHA, which mq gate matched against its CI pass). A PR whose
+// head moved after the gate, or whose head cannot be read, is refused.
+func verifyGatedMergedPRHead(rigGit mqPostMergeGit, mr *refinery.MergeRequest) error {
+	head := strings.TrimSpace(mr.CommitSHA)
+	pr, err := rigGit.LookupPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: mr.Branch})
+	if err != nil {
+		return fmt.Errorf("merged PR head for MR %s: %w", mr.ID, err)
+	}
+	actual := ""
+	if pr != nil {
+		actual = strings.TrimSpace(pr.HeadSHA)
+	}
+	if actual == "" {
+		return fmt.Errorf("merged PR head for MR %s is unknown: refusing (fail closed)", mr.ID)
+	}
+	if actual != head {
+		return fmt.Errorf("merged PR head for MR %s is %s, not the gated head %s", mr.ID, actual, head)
+	}
+	return nil
 }
 
 func verifyMQPostMergeProof(rigGit mqPostMergeGit, mr *refinery.MergeRequest) error {

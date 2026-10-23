@@ -129,7 +129,7 @@ func TestRunVerifiedMQPostMerge_GatedPassRecordsDone(t *testing.T) {
 	rigPath, env, mr := gatedPostMergeRig(t)
 	addCICheck(t, env, mr.IssueID, true, "head "+mr.CommitSHA)
 	mgr := &fakeMQPostMergeManager{mr: mr}
-	rigGit := &fakeMQPostMergeGit{localHead: mr.CommitSHA}
+	rigGit := &fakeMQPostMergeGit{localHead: mr.CommitSHA, prHead: mr.CommitSHA}
 
 	if _, _, err := runVerifiedMQPostMerge(mgr, "gastown", rigPath, rigGit, mr.ID, true); err != nil {
 		t.Fatalf("runVerifiedMQPostMerge: %v", err)
@@ -183,8 +183,103 @@ func TestRunVerifiedMQPostMerge_NonGatedItemUnchanged(t *testing.T) {
 	rigPath, _, mr := gatedPostMergeRig(t)
 	mr.IssueID = "gt-not-an-item"
 	mgr := &fakeMQPostMergeManager{mr: mr}
-	rigGit := &fakeMQPostMergeGit{localHead: mr.CommitSHA}
+	rigGit := &fakeMQPostMergeGit{localHead: mr.CommitSHA, prHead: mr.CommitSHA}
 	if _, _, err := runVerifiedMQPostMerge(mgr, "gastown", rigPath, rigGit, mr.ID, true); err != nil || !mgr.postMergeCalled {
 		t.Fatalf("err = %v called = %v, want plain post-merge", err, mgr.postMergeCalled)
+	}
+}
+
+// moveBackToMerge moves the item merge->execute->merge so a CI pass
+// recorded before the call predates the latest transition into merge.
+func moveBackToMerge(t *testing.T, env workflow.GateEnv, id string) {
+	t.Helper()
+	if err := env.Store.Transition(id, "merge", "execute", "refinery"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	if err := env.Store.Transition(id, "execute", "merge", "refinery"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+}
+
+func TestRunVerifiedMQPostMerge_GatedStaleCIPassRefused(t *testing.T) {
+	rigPath, env, mr := gatedPostMergeRig(t)
+	addCICheck(t, env, mr.IssueID, true, "head "+mr.CommitSHA)
+	moveBackToMerge(t, env, mr.IssueID)
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{remoteTip: mr.CommitSHA, localHead: mr.CommitSHA}
+
+	_, _, err := runVerifiedMQPostMerge(mgr, "gastown", rigPath, rigGit, mr.ID, false)
+	if err == nil || !strings.Contains(err.Error(), "did not pass the merge gate") {
+		t.Fatalf("err = %v, want refusal for a CI pass older than the latest merge transition", err)
+	}
+	if mgr.postMergeCalled {
+		t.Fatal("post-merge ran on a stale CI pass")
+	}
+	if trs, _ := env.Store.Transitions(mr.IssueID); trs[len(trs)-1].To == workflow.StepDone {
+		t.Fatal("done recorded on a stale CI pass")
+	}
+}
+
+func TestRunVerifiedMQPostMerge_GatedFreshCIPassAfterMergeAccepted(t *testing.T) {
+	rigPath, env, mr := gatedPostMergeRig(t)
+	addCICheck(t, env, mr.IssueID, true, "head "+mr.CommitSHA)
+	moveBackToMerge(t, env, mr.IssueID)
+	addCICheck(t, env, mr.IssueID, true, "head "+mr.CommitSHA)
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{localHead: mr.CommitSHA, prHead: mr.CommitSHA}
+
+	if _, _, err := runVerifiedMQPostMerge(mgr, "gastown", rigPath, rigGit, mr.ID, true); err != nil {
+		t.Fatalf("runVerifiedMQPostMerge: %v", err)
+	}
+	if !mgr.postMergeCalled {
+		t.Fatal("PostMerge not called for a gated item with a fresh CI pass")
+	}
+}
+
+func TestRunVerifiedMQPostMerge_GatedMergedPRHeadMismatchRefused(t *testing.T) {
+	rigPath, env, mr := gatedPostMergeRig(t)
+	addCICheck(t, env, mr.IssueID, true, "head "+mr.CommitSHA)
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{localHead: mr.CommitSHA, prHead: "h2h2h2h2"}
+
+	_, _, err := runVerifiedMQPostMerge(mgr, "gastown", rigPath, rigGit, mr.ID, true)
+	if err == nil || !strings.Contains(err.Error(), "merged PR head") {
+		t.Fatalf("err = %v, want refusal for a merged PR head other than the gated head", err)
+	}
+	if mgr.postMergeCalled {
+		t.Fatal("post-merge ran with a merged PR head other than the gated head")
+	}
+	if trs, _ := env.Store.Transitions(mr.IssueID); trs[len(trs)-1].To == workflow.StepDone {
+		t.Fatal("done recorded with a mismatched PR head")
+	}
+}
+
+func TestRunVerifiedMQPostMerge_GatedMergedPRHeadUnknownFailsClosed(t *testing.T) {
+	rigPath, env, mr := gatedPostMergeRig(t)
+	addCICheck(t, env, mr.IssueID, true, "head "+mr.CommitSHA)
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{localHead: mr.CommitSHA, lookupErr: errors.New("gh unavailable")}
+
+	if _, _, err := runVerifiedMQPostMerge(mgr, "gastown", rigPath, rigGit, mr.ID, true); err == nil {
+		t.Fatal("runVerifiedMQPostMerge succeeded without a determinable merged PR head")
+	}
+	if mgr.postMergeCalled {
+		t.Fatal("post-merge ran without a determinable merged PR head")
+	}
+}
+
+func TestRunVerifiedMQPostMerge_GatedMergedPRHeadMatchAccepted(t *testing.T) {
+	rigPath, env, mr := gatedPostMergeRig(t)
+	addCICheck(t, env, mr.IssueID, true, "head "+mr.CommitSHA)
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{localHead: mr.CommitSHA, prHead: mr.CommitSHA}
+
+	if _, _, err := runVerifiedMQPostMerge(mgr, "gastown", rigPath, rigGit, mr.ID, true); err != nil {
+		t.Fatalf("runVerifiedMQPostMerge: %v", err)
+	}
+	if !mgr.postMergeCalled {
+		t.Fatal("PostMerge not called when the merged PR head is the gated head")
 	}
 }
