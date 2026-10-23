@@ -17,6 +17,8 @@ SERVER    ?= https://gtb.nhaboc.com
 BRANCH    ?= feat/gtb-reshape
 REPO_URL  ?= https://github.com/baovo15/gtb.git
 LOG       ?= $(WORKSPACE)/gtb-test.log
+# DOLT_PORT: set when another Dolt already holds 3307 (e.g. DOLT_PORT=3308).
+DOLT_PORT ?=
 
 SRC  := $(WORKSPACE)/gtb-test
 GTB  := $(SRC)/gtb
@@ -31,9 +33,9 @@ MAKEFILE := $(firstword $(MAKEFILE_LIST))
 all:
 	@$(SH) mkdir -p "$(WORKSPACE)"; \
 	{ echo "=== $$(date -u +%Y-%m-%dT%H:%M:%SZ) gtb install"; sw_vers 2>/dev/null || uname -sr; uname -m; \
-	  echo "make $(MAKE_VERSION); WORKSPACE=$(WORKSPACE) SERVER=$(SERVER) BRANCH=$(BRANCH)"; } > "$(LOG)"; \
+	  echo "make $(MAKE_VERSION); WORKSPACE=$(WORKSPACE) SERVER=$(SERVER) BRANCH=$(BRANCH) DOLT_PORT=$(DOLT_PORT)"; } > "$(LOG)"; \
 	echo "==> log: $(LOG)"; \
-	$(MAKE) -f "$(MAKEFILE)" run TRACE=1 CODE="$(CODE)" WORKSPACE="$(WORKSPACE)" SERVER="$(SERVER)" BRANCH="$(BRANCH)" 2>&1 \
+	$(MAKE) -f "$(MAKEFILE)" run TRACE=1 CODE="$(CODE)" WORKSPACE="$(WORKSPACE)" SERVER="$(SERVER)" BRANCH="$(BRANCH)" DOLT_PORT="$(DOLT_PORT)" 2>&1 \
 	  | sed -E "s/(--code[ =]+[\"']?)[A-Za-z0-9]+/\1<code>/; s/(CODE=[\"']?)[A-Za-z0-9]+/\1<code>/" \
 	  | tee -a "$(LOG)"; \
 	echo "==> full log: $(LOG)"
@@ -69,7 +71,7 @@ town:
 	else \
 	  echo "==> gtb install $(TOWN)"; \
 	  mkdir -p "$(TOWN)"; \
-	  "$(GTB)" install "$(TOWN)" --force; \
+	  "$(GTB)" install "$(TOWN)" --force$(if $(DOLT_PORT), --dolt-port $(DOLT_PORT)); \
 	  [ -f "$(TOWN)/mayor/town.json" ] || { echo "install did not create $(TOWN)/mayor/town.json"; exit 1; }; \
 	fi
 
