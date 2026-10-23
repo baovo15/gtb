@@ -283,3 +283,23 @@ func TestRunVerifiedMQPostMerge_GatedMergedPRHeadMatchAccepted(t *testing.T) {
 		t.Fatal("PostMerge not called when the merged PR head is the gated head")
 	}
 }
+
+// A PR head moved after the gate is rejected at the lookup level (the ref
+// pins the gated head), before the after-the-fact compare runs.
+func TestRunVerifiedMQPostMerge_GatedMergedPRHeadPinnedAtLookup(t *testing.T) {
+	rigPath, env, mr := gatedPostMergeRig(t)
+	addCICheck(t, env, mr.IssueID, true, "head "+mr.CommitSHA)
+	mgr := &fakeMQPostMergeManager{mr: mr}
+	rigGit := &fakeMQPostMergeGit{localHead: mr.CommitSHA, prHead: "h2h2h2h2"}
+
+	_, _, err := runVerifiedMQPostMerge(mgr, "gastown", rigPath, rigGit, mr.ID, true)
+	if err == nil || !strings.Contains(err.Error(), "merged PR head for MR") || !strings.Contains(err.Error(), "head changed") {
+		t.Fatalf("err = %v, want lookup-level head rejection naming the merged PR head", err)
+	}
+	if rigGit.lookupHeadPinned != mr.CommitSHA {
+		t.Fatalf("lookup ref HeadSHA = %q, want gated head %s", rigGit.lookupHeadPinned, mr.CommitSHA)
+	}
+	if mgr.postMergeCalled {
+		t.Fatal("post-merge ran with a moved PR head")
+	}
+}

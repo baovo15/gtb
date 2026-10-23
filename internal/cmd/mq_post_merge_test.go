@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -42,6 +43,8 @@ type fakeMQPostMergeGit struct {
 	tipErr    error
 	prHead    string
 	lookupErr error
+	// lookupHeadPinned records the HeadSHA of the last LookupPullRequest ref.
+	lookupHeadPinned string
 
 	verifiedCommits []string
 	deletedBranches []string
@@ -62,11 +65,18 @@ func (g *fakeMQPostMergeGit) PushRemoteBranchTip(_, _ string) (string, error) {
 	return g.remoteTip, g.tipErr
 }
 
-func (g *fakeMQPostMergeGit) LookupPullRequest(git.PullRequestRef) (*git.PullRequestInfo, error) {
+// LookupPullRequest mirrors git.Git.LookupPullRequest: a non-empty HeadSHA in
+// the ref is validated against the PR head and a mismatch is an error.
+func (g *fakeMQPostMergeGit) LookupPullRequest(ref git.PullRequestRef) (*git.PullRequestInfo, error) {
 	if g.lookupErr != nil {
 		return nil, g.lookupErr
 	}
-	return &git.PullRequestInfo{Number: 1, State: "MERGED", HeadSHA: g.prHead}, nil
+	pr := &git.PullRequestInfo{Number: 1, State: "MERGED", HeadSHA: g.prHead}
+	g.lookupHeadPinned = strings.TrimSpace(ref.HeadSHA)
+	if want := strings.TrimSpace(ref.HeadSHA); want != "" && pr.HeadSHA != want {
+		return nil, fmt.Errorf("PR #%d head changed from submitted %s to %s", pr.Number, want, pr.HeadSHA)
+	}
+	return pr, nil
 }
 
 func (g *fakeMQPostMergeGit) Rev(string) (string, error) {

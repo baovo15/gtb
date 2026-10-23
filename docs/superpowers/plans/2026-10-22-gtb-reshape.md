@@ -48,7 +48,7 @@ Existing roles (polecats, refinery, witness, Mayor) are wired into the workflow 
 - Requests from the server form a closed set: `approve`, `request_changes`, `item.create`, `item.sling`, `item.cancel`, `snapshot`, `inspect`, `terminal.peek`. There are no shell strings and no paths (§7.3).
 - Requests are idempotent by `key`, and a request past `expires_at` is never run (§7.3).
 - Every server request comes from the maintainer's browser session. `approve` and `request_changes` are refused for API tokens. Machines never send requests to other machines (D2, §7.3).
-- The machine token lives at `<townRoot>/.runtime/machine-token`, mode 0600, and is never logged (§6).
+- The machine token lives at `<townRoot>/.runtime/agentlink/machine-token`, mode 0600, and is never logged (§6).
 
 **Server data and auth**
 - Server retention: events and evidence summaries are kept 90 days. Artifacts and item projections are kept until the item is deleted (§7.2).
@@ -501,7 +501,7 @@ These are the likely failure modes that no task's main tests cover. Each one has
     - The token is 256-bit random and is stored as a sha256.
     - The code is consumed atomically.
     - An unknown, used or expired code gives `401 {"error":"invalid_code"}`.
-  - `func agentlink.SaveToken(townRoot, token string) error` writes `<townRoot>/.runtime/machine-token` with mode 0600, plus `machine.json` holding `{server_url, machine_id}`.
+  - `func agentlink.SaveToken(townRoot, token string) error` writes `<townRoot>/.runtime/agentlink/machine-token` with mode 0600, plus `machine.json` holding `{server_url, machine_id}`.
   - `func agentlink.LoadToken(townRoot string) (serverURL, machineID, token string, err error)` refuses a token file whose mode is more open than 0600.
   - `func agentlink.ValidateServerURL(u string) error` allows `https://` anywhere and `http://` only for `127.0.0.1`, `localhost` and `[::1]`.
   - `gtb join <server-url> --code <code>`.

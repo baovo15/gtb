@@ -622,7 +622,9 @@ func runVerifiedMQPostMerge(mgr mqPostMergeManager, rigName, rigPath string, rig
 // head moved after the gate, or whose head cannot be read, is refused.
 func verifyGatedMergedPRHead(rigGit mqPostMergeGit, mr *refinery.MergeRequest) error {
 	head := strings.TrimSpace(mr.CommitSHA)
-	pr, err := rigGit.LookupPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: mr.Branch})
+	// HeadSHA pins the gated head so the lookup rejects a PR whose head moved
+	// (validatePullRequestHead); the compare below is a second check.
+	pr, err := rigGit.LookupPullRequest(git.PullRequestRef{URL: mr.PRURL, Number: mr.PRNumber, Branch: mr.Branch, HeadSHA: head})
 	if err != nil {
 		return fmt.Errorf("merged PR head for MR %s: %w", mr.ID, err)
 	}

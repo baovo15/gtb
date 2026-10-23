@@ -2,9 +2,11 @@ package agentlink
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -180,8 +182,17 @@ func TestLoadToken_RefusesSymlinkedToken(t *testing.T) {
 	if err := os.Symlink(real, p); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, tok, err := LoadToken(root); err == nil || tok != "" {
+	if fi, err := os.Lstat(p); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("test setup: %s is not a symlink (%v)", p, err)
+	}
+	_, _, tok, err := LoadToken(root)
+	if err == nil || tok != "" {
 		t.Fatalf("symlinked token accepted: tok=%q err=%v", tok, err)
+	}
+	// The refusal must come from O_NOFOLLOW (ELOOP on linux and darwin), not
+	// from some other open failure such as a missing file.
+	if !errors.Is(err, syscall.ELOOP) {
+		t.Fatalf("symlink refusal error = %v, want ELOOP from O_NOFOLLOW", err)
 	}
 }
 
