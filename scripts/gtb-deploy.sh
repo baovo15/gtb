@@ -76,7 +76,18 @@ sed "s|IMAGE_TAG|$TAG|" "$SRC/deploy/k3s/gtb.yaml" | kubectl apply -f -
 if [ -n "${GTB_ADMIN_TOKEN:-}" ] && [ -n "$had_sts" ]; then
   kubectl -n "$NS" rollout restart sts/gtb-server
 fi
-kubectl -n "$NS" rollout status sts/gtb-server --timeout=5m
+# apply has already pointed Service gtb at app: gtb-server, so a failed
+# rollout leaves gtb.nhaboc.com with no backend: say how to go back.
+if ! kubectl -n "$NS" rollout status sts/gtb-server --timeout=5m; then
+  echo "ROLLOUT FAILED: gtb.nhaboc.com has no backend. To go back to the old Gas Town pod:" >&2
+  if kubectl -n "$NS" get sts gtb >/dev/null 2>&1; then
+    echo "  kubectl -n $NS patch svc gtb -p '{\"spec\":{\"selector\":{\"app\":\"gtb\"}}}'" >&2
+  else
+    echo "  (none: the old StatefulSet gtb no longer exists)" >&2
+  fi
+  echo "Inspect: kubectl -n $NS describe pod $POD; kubectl -n $NS logs $POD" >&2
+  exit 1
+fi
 
 step "Admin token"
 # The server prints the token frame once, on the first start of an empty
@@ -87,6 +98,12 @@ if [ -n "$frame" ]; then
   echo "This is shown once. Store it now."
 elif [ -n "${GTB_ADMIN_TOKEN:-}" ]; then
   echo "The admin token is the GTB_ADMIN_TOKEN you passed in."
+elif [ -n "$(kubectl -n "$NS" get secret gtb-server -o jsonpath='{.data.GTB_ADMIN_TOKEN}' 2>/dev/null || true)" ]; then
+  # Only tested for non-empty; never printed. The server adopts this env
+  # token on every start, so an in-pod --rotate would be undone.
+  echo "No token frame in the log: the token is managed by Secret gtb-server."
+  echo "To change it, re-run this script with GTB_ADMIN_TOKEN=<new> (or edit the Secret), then:"
+  echo "  kubectl -n $NS rollout restart sts/gtb-server"
 else
   echo "No token frame in the log: an admin token already exists."
   echo "To replace it (revokes all sessions; the new token is printed once):"
