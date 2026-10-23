@@ -28,6 +28,21 @@ builds:
           - CGO_ENABLED=1
           - CC=aarch64-linux-gnu-gcc
           - CXX=aarch64-linux-gnu-g++
+      # darwin builds are CGO-free: the gms_pure_go tag switches go-mysql-server
+      # to its pure-Go regex engine, so no ICU library is needed. This keeps
+      # darwin cross-compilation from Linux working without a clang/osxcross toolchain.
+      - goos: darwin
+        goarch: amd64
+        env:
+          - CGO_ENABLED=0
+        flags:
+          - -tags=gms_pure_go
+      - goos: darwin
+        goarch: arm64
+        env:
+          - CGO_ENABLED=0
+        flags:
+          - -tags=gms_pure_go
     ldflags:
       - -s -w
       - -X github.com/steveyegge/gastown/internal/cmd.Version={{.Version}}
