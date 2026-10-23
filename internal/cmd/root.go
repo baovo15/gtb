@@ -106,6 +106,7 @@ var beadsExemptCommands = map[string]bool{
 	"health":        true, // Health check doesn't require beads
 	"upgrade":       true, // Post-install migration orchestrator
 	"heartbeat":     true, // Heartbeat state update — must be fast and dependency-free
+	"server":        true, // gtb server runs in a pod with no town or beads
 }
 
 // Commands exempt from the town root branch warning.
@@ -122,6 +123,7 @@ var branchCheckExemptCommands = map[string]bool{
 	"git-init":    true, // Git setup
 	"upgrade":     true, // Post-install migration
 	"scheduler":   true, // Daemon hot path; scheduler handles beads internally
+	"server":      true, // gtb server runs in a pod with no town
 }
 
 // persistentPreRun runs before every command.

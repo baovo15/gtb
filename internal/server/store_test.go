@@ -45,7 +45,7 @@ func sha(s string) string {
 
 func TestOpenStore_Tables(t *testing.T) {
 	s := openTest(t)
-	for _, tbl := range []string{"machines", "tokens", "enroll_codes", "rigs", "items", "artifacts", "events", "requests", "results", "web_sessions", "sessions", "schema_version"} {
+	for _, tbl := range []string{"machines", "tokens", "enroll_codes", "rigs", "items", "artifacts", "events", "requests", "results", "web_sessions", "sessions", "schema_version", "admin"} {
 		var n int
 		if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`, tbl).Scan(&n); err != nil || n != 1 {
 			t.Errorf("table %s missing (n=%d err=%v)", tbl, n, err)
@@ -501,5 +501,36 @@ func TestOpenStore_MigratesV1(t *testing.T) {
 	}
 	if m, _ := s.Machine("m1"); !m.HasSnapshot {
 		t.Fatal("has_snapshot not set after snapshot")
+	}
+}
+
+func TestOpenStore_MigratesV2(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gtb.db")
+	s, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`DROP TABLE admin`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE schema_version SET version = 2`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s, err = OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var v int
+	if err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil || v != 3 {
+		t.Fatalf("schema_version = %d, %v", v, err)
+	}
+	if _, err := s.Admin(); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("admin after migration: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO admin(id, token_sha, csrf_key, created_at) VALUES (2, 'x', x'00', 0)`); err == nil {
+		t.Fatal("admin accepted id != 1")
 	}
 }

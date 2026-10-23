@@ -45,13 +45,17 @@ const (
 	RequestExpired   = "expired"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // Store is the server's SQLite database. All writes go through a single
 // connection, so they are serialized.
 type Store struct {
 	db       *sql.DB
 	notifier *requestNotifier
+	// board wakes dashboard SSE streams when items, artifacts, sessions or
+	// events change (ApplySnapshot, AppendEvents). It is separate from
+	// notifier, which wakes machine long-polls.
+	board *broadcaster
 }
 
 // Machine is a row of the machines table.
@@ -82,6 +86,9 @@ type ItemRow struct {
 	agentlink.ItemView
 	MachineID string
 	UpdatedAt time.Time
+	// MachineLastSeenAt is the owning machine's last_seen_at, joined in so
+	// callers can compute freshness.
+	MachineLastSeenAt time.Time
 }
 
 const schema = `
@@ -197,6 +204,17 @@ CREATE TABLE IF NOT EXISTS web_sessions (
 	created_at INTEGER NOT NULL,
 	expires_at INTEGER NOT NULL
 );
+` + adminSchema
+
+// adminSchema is the v3 admin table: the sha256 of the dashboard admin token
+// and the key that derives per-session CSRF tokens. There is at most one row.
+const adminSchema = `
+CREATE TABLE IF NOT EXISTS admin (
+	id         INTEGER PRIMARY KEY CHECK (id = 1),
+	token_sha  TEXT NOT NULL,
+	csrf_key   BLOB NOT NULL,
+	created_at INTEGER
+);
 `
 
 // OpenStore opens (creating if needed) the SQLite store at path. The parent
@@ -211,7 +229,7 @@ func OpenStore(path string) (*Store, error) {
 		return nil, fmt.Errorf("server: open store: %w", err)
 	}
 	db.SetMaxOpenConns(1) // serialize all access, writes included
-	s := &Store{db: db, notifier: newRequestNotifier()}
+	s := &Store{db: db, notifier: newRequestNotifier(), board: newBroadcaster()}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -247,6 +265,12 @@ func (s *Store) migrate() error {
 		// v2: machines.has_snapshot.
 		if _, err := tx.Exec(`ALTER TABLE machines ADD COLUMN has_snapshot INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return fmt.Errorf("server: migrate to v2: %w", err)
+		}
+	}
+	if v < 3 {
+		// v3: admin (dashboard admin token and CSRF key).
+		if _, err := tx.Exec(adminSchema); err != nil {
+			return fmt.Errorf("server: migrate to v3: %w", err)
 		}
 	}
 	if v < schemaVersion {
@@ -481,7 +505,11 @@ func (s *Store) ApplySnapshot(machineID string, snap agentlink.Snapshot) error {
 			return fmt.Errorf("server: apply snapshot: %w", err)
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("server: apply snapshot: %w", err)
+	}
+	s.board.notify()
+	return nil
 }
 
 func validEventType(t string) bool {
@@ -533,6 +561,7 @@ func (s *Store) appendEvents(machineID string, after *string, evs []agentlink.Ev
 		}
 	}
 	var last string
+	stored := 0
 	for _, ev := range evs {
 		if ev.ID == "" || !validEventType(ev.Type) {
 			return "", fmt.Errorf("%w: id=%q type=%q", ErrInvalidEvent, ev.ID, ev.Type)
@@ -552,6 +581,7 @@ func (s *Store) appendEvents(machineID string, after *string, evs []agentlink.Ev
 		if n, _ := res.RowsAffected(); n == 0 {
 			continue // already stored and projected
 		}
+		stored++
 		if err := project(tx, machineID, ev, now); err != nil {
 			return "", fmt.Errorf("server: project event %s: %w", ev.ID, err)
 		}
@@ -563,6 +593,9 @@ func (s *Store) appendEvents(machineID string, after *string, evs []agentlink.Ev
 	}
 	if err := tx.Commit(); err != nil {
 		return "", fmt.Errorf("server: append events: %w", err)
+	}
+	if stored > 0 {
+		s.board.notify()
 	}
 	return last, nil
 }
@@ -603,24 +636,24 @@ func project(tx *sql.Tx, machineID string, ev agentlink.Event, now int64) error 
 // Items returns item projections matching f, without artifacts, ordered by
 // machine, rig and id.
 func (s *Store) Items(f ItemFilter) ([]ItemRow, error) {
-	q := `SELECT machine_id, updated_at, view FROM items WHERE 1=1`
+	q := `SELECT i.machine_id, i.updated_at, i.view, m.last_seen_at FROM items i JOIN machines m ON m.id = i.machine_id WHERE 1=1`
 	var args []any
 	if f.MachineID != "" {
-		q += ` AND machine_id = ?`
+		q += ` AND i.machine_id = ?`
 		args = append(args, f.MachineID)
 	}
 	if f.Rig != "" {
-		q += ` AND rig = ?`
+		q += ` AND i.rig = ?`
 		args = append(args, f.Rig)
 	}
 	if f.Kind != "" {
-		q += ` AND kind = ?`
+		q += ` AND i.kind = ?`
 		args = append(args, f.Kind)
 	}
 	if f.WaitingOnly {
-		q += ` AND waiting_for_human <> ''`
+		q += ` AND i.waiting_for_human <> ''`
 	}
-	q += ` ORDER BY machine_id, rig, id`
+	q += ` ORDER BY i.machine_id, i.rig, i.id`
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("server: items: %w", err)
@@ -639,21 +672,23 @@ func (s *Store) Items(f ItemFilter) ([]ItemRow, error) {
 
 func scanItem(row interface{ Scan(...any) error }) (*ItemRow, error) {
 	var r ItemRow
-	var updated int64
+	var updated, seen int64
 	var view string
-	if err := row.Scan(&r.MachineID, &updated, &view); err != nil {
+	if err := row.Scan(&r.MachineID, &updated, &view, &seen); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(view), &r.ItemView); err != nil {
 		return nil, err
 	}
 	r.UpdatedAt = fromMS(updated)
+	r.MachineLastSeenAt = fromMS(seen)
 	return &r, nil
 }
 
 // Item returns one item and its artifacts (ordered by name), or ErrNotFound.
 func (s *Store) Item(machineID, id string) (*ItemRow, []agentlink.ArtifactView, error) {
-	r, err := scanItem(s.db.QueryRow(`SELECT machine_id, updated_at, view FROM items WHERE machine_id = ? AND id = ?`, machineID, id))
+	r, err := scanItem(s.db.QueryRow(`SELECT i.machine_id, i.updated_at, i.view, m.last_seen_at FROM items i JOIN machines m ON m.id = i.machine_id
+		WHERE i.machine_id = ? AND i.id = ?`, machineID, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, ErrNotFound
 	}
@@ -870,4 +905,66 @@ func (s *Store) RequestStatus(machineID, key string, now time.Time) (string, *ag
 		res.Data = json.RawMessage(data.String)
 	}
 	return status, res, nil
+}
+
+// Machines returns every machine, revoked ones included, ordered by id.
+func (s *Store) Machines() ([]Machine, error) {
+	rows, err := s.db.Query(`SELECT ` + machineCols + ` FROM machines m ORDER BY m.id`)
+	if err != nil {
+		return nil, fmt.Errorf("server: machines: %w", err)
+	}
+	defer rows.Close()
+	var out []Machine
+	for rows.Next() {
+		m, err := scanMachine(rows)
+		if err != nil {
+			return nil, fmt.Errorf("server: machines: %w", err)
+		}
+		out = append(out, *m)
+	}
+	return out, rows.Err()
+}
+
+// Rigs returns the machine's rigs ordered by name.
+func (s *Store) Rigs(machineID string) ([]agentlink.Rig, error) {
+	rows, err := s.db.Query(`SELECT name, remote, gated FROM rigs WHERE machine_id = ? ORDER BY name`, machineID)
+	if err != nil {
+		return nil, fmt.Errorf("server: rigs: %w", err)
+	}
+	defer rows.Close()
+	out := []agentlink.Rig{}
+	for rows.Next() {
+		var r agentlink.Rig
+		if err := rows.Scan(&r.Name, &r.Remote, &r.Gated); err != nil {
+			return nil, fmt.Errorf("server: rigs: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ItemEvents returns up to limit of the item's events, newest (greatest ID)
+// first.
+func (s *Store) ItemEvents(machineID, itemID string, limit int) ([]agentlink.Event, error) {
+	rows, err := s.db.Query(`SELECT id, at, type, item_id, data FROM events
+		WHERE machine_id = ? AND item_id = ? ORDER BY id DESC LIMIT ?`, machineID, itemID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("server: item events: %w", err)
+	}
+	defer rows.Close()
+	out := []agentlink.Event{}
+	for rows.Next() {
+		var ev agentlink.Event
+		var at int64
+		var data sql.NullString
+		if err := rows.Scan(&ev.ID, &at, &ev.Type, &ev.ItemID, &data); err != nil {
+			return nil, fmt.Errorf("server: item events: %w", err)
+		}
+		ev.At = fromMS(at)
+		if data.Valid {
+			ev.Data = json.RawMessage(data.String)
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
 }

@@ -52,6 +52,11 @@ func randomBytes(n int) ([]byte, error) {
 // its sha256 is stored, so the returned value is the only copy. A ttl <= 0
 // means DefaultEnrollCodeTTL.
 func (s *Store) CreateEnrollCode(ttl time.Duration) (string, error) {
+	return s.createEnrollCode(ttl, time.Now())
+}
+
+// createEnrollCode is CreateEnrollCode with an explicit clock.
+func (s *Store) createEnrollCode(ttl time.Duration, now time.Time) (string, error) {
 	if ttl <= 0 {
 		ttl = DefaultEnrollCodeTTL
 	}
@@ -60,7 +65,6 @@ func (s *Store) CreateEnrollCode(ttl time.Duration) (string, error) {
 		return "", fmt.Errorf("server: generate enroll code: %w", err)
 	}
 	code := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)
-	now := time.Now()
 	if _, err := s.db.Exec(`INSERT INTO enroll_codes(sha, created_at, expires_at) VALUES (?, ?, ?)`,
 		sha256Hex(code), ms(now), ms(now.Add(ttl))); err != nil {
 		return "", fmt.Errorf("server: store enroll code: %w", err)
