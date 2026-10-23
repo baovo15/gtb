@@ -132,7 +132,7 @@ func assertNoToken(t *testing.T, e *joinEnv, out string) {
 			t.Fatalf("token leaked to output: %q", out)
 		}
 	}
-	if b, err := os.ReadFile(filepath.Join(e.townRoot, ".runtime", "machine-token")); err == nil {
+	if b, err := os.ReadFile(agentlink.TokenPath(e.townRoot)); err == nil {
 		if tok := strings.TrimSpace(string(b)); tok != "" && strings.Contains(out, tok) {
 			t.Fatalf("saved token leaked to output: %q", out)
 		}
@@ -245,7 +245,7 @@ func TestJoin_InvalidCode(t *testing.T) {
 	if err == nil || !strings.Contains(out, "enrollment code is invalid, used or expired") {
 		t.Fatalf("got %v\n%s", err, out)
 	}
-	if _, err := os.Stat(filepath.Join(e.townRoot, ".runtime", "machine-token")); !os.IsNotExist(err) {
+	if _, err := os.Stat(agentlink.TokenPath(e.townRoot)); !os.IsNotExist(err) {
 		t.Fatal("token file written on failure")
 	}
 }

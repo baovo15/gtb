@@ -126,7 +126,7 @@ Changing `check_commands` needs a human approval, as in tbb.
 - **Join the server:** `gtb join https://gtb.nhaboc.com --code <one-time-code>` **(proposal)**.
   1. The maintainer creates a one-time, single-use enrollment code in the dashboard.
   2. `gtb join` exchanges it for a machine token.
-  3. The token is stored owner-only in `~/gtb/.runtime/machine-token` and is never logged.
+  3. The token is stored owner-only in `~/gtb/.runtime/agentlink/machine-token` and is never logged.
 - **Add a repo:** `gtb rig add <git-url>`, as today, after which the rig is reported to the server.
 - **Runtime:** a local Dolt server, the daemon, the Deacon, the Mayor, a Witness and Refinery per rig, and polecats in tmux. This is unchanged from Gas Town. Every machine runs its own Mayor for its own rigs **(maintainer)**.
 - **Fresh start:** no existing Gas Town towns are migrated. `gtb install` creates a new town **(proposal)**.

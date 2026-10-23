@@ -44,7 +44,7 @@ var joinCmd = &cobra.Command{
 	Long: `Enroll this town's machine with a gtb server using a one-time code.
 
 The server URL must be https://, or http:// to 127.0.0.1, localhost or [::1].
-On success the machine token is saved to <town>/.runtime/machine-token
+On success the machine token is saved to <town>/.runtime/agentlink/machine-token
 (mode 0600) and the server URL and machine id to
 <town>/.runtime/agentlink/machine.json. The token is never printed.
 

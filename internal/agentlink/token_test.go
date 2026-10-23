@@ -13,7 +13,7 @@ func TestSaveLoadToken(t *testing.T) {
 	if err := SaveToken(root, "https://gtb.example.com", "abc123", "tok-secret"); err != nil {
 		t.Fatal(err)
 	}
-	tokPath := filepath.Join(root, ".runtime", "machine-token")
+	tokPath := TokenPath(root)
 	mjPath := filepath.Join(root, ".runtime", "agentlink", "machine.json")
 	for _, p := range []string{tokPath, mjPath} {
 		fi, err := os.Stat(p)
@@ -67,7 +67,7 @@ func TestLoadToken_TrimsWhitespace(t *testing.T) {
 	if err := SaveToken(root, "https://gtb.example.com", "m1", "tok"); err != nil {
 		t.Fatal(err)
 	}
-	p := filepath.Join(root, ".runtime", "machine-token")
+	p := TokenPath(root)
 	if err := os.WriteFile(p, []byte("  tok\n\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestLoadToken_RejectsWorldReadable(t *testing.T) {
 		if err := SaveToken(root, "https://gtb.example.com", "m1", "tok"); err != nil {
 			t.Fatal(err)
 		}
-		p := filepath.Join(root, ".runtime", "machine-token")
+		p := TokenPath(root)
 		if err := os.Chmod(p, mode); err != nil {
 			t.Fatal(err)
 		}
@@ -164,5 +164,111 @@ func TestNormalizeServerURL_StripsTrailingSlash(t *testing.T) {
 		if err != nil || got != want {
 			t.Errorf("NormalizeServerURL(%q) = %q, %v; want %q", in, got, err, want)
 		}
+	}
+}
+
+func TestLoadToken_RefusesSymlinkedToken(t *testing.T) {
+	root := t.TempDir()
+	if err := SaveToken(root, "https://gtb.example.com", "m1", "tok"); err != nil {
+		t.Fatal(err)
+	}
+	p := TokenPath(root)
+	real := filepath.Join(t.TempDir(), "elsewhere-token")
+	if err := os.Rename(p, real); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(real, p); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, tok, err := LoadToken(root); err == nil || tok != "" {
+		t.Fatalf("symlinked token accepted: tok=%q err=%v", tok, err)
+	}
+}
+
+func TestLoadToken_Refuses0644Token(t *testing.T) {
+	root := t.TempDir()
+	if err := SaveToken(root, "https://gtb.example.com", "m1", "tok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(TokenPath(root), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, tok, err := LoadToken(root); err == nil || tok != "" {
+		t.Fatalf("0644 token accepted: tok=%q err=%v", tok, err)
+	}
+}
+
+func TestLoadToken_Accepts0600RegularToken(t *testing.T) {
+	root := t.TempDir()
+	if err := SaveToken(root, "https://gtb.example.com", "m1", "tok"); err != nil {
+		t.Fatal(err)
+	}
+	if _, id, tok, err := LoadToken(root); err != nil || id != "m1" || tok != "tok" {
+		t.Fatalf("0600 regular token: id=%q tok=%q err=%v", id, tok, err)
+	}
+}
+
+func TestSaveToken_DoesNotChmodSharedRuntimeDir(t *testing.T) {
+	root := t.TempDir()
+	runtimeDir := filepath.Join(root, ".runtime")
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(runtimeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveToken(root, "https://gtb.example.com", "m1", "tok"); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(runtimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o755 {
+		t.Fatalf(".runtime mode = %#o, want 0755 (must not be chmodded)", fi.Mode().Perm())
+	}
+}
+
+func TestSaveToken_AgentlinkDirIs0700(t *testing.T) {
+	root := t.TempDir()
+	if err := SaveToken(root, "https://gtb.example.com", "m1", "tok"); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(filepath.Join(root, ".runtime", "agentlink"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o700 {
+		t.Fatalf(".runtime/agentlink mode = %#o, want 0700", fi.Mode().Perm())
+	}
+	if _, err := os.Stat(TokenPath(root)); err != nil {
+		t.Fatalf("token not at new path %s: %v", TokenPath(root), err)
+	}
+}
+
+func TestLoadToken_MigratesLegacyTokenPath(t *testing.T) {
+	root := t.TempDir()
+	if err := SaveToken(root, "https://gtb.example.com", "m1", "tok"); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a machine enrolled before the change: token at the legacy path.
+	legacy := filepath.Join(root, ".runtime", "machine-token")
+	if err := os.Rename(TokenPath(root), legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, id, tok, err := LoadToken(root); err != nil || id != "m1" || tok != "tok" {
+		t.Fatalf("legacy load: id=%q tok=%q err=%v", id, tok, err)
+	}
+	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("legacy token not removed after migration: %v", err)
+	}
+	if _, err := os.Stat(TokenPath(root)); err != nil {
+		t.Fatalf("token not migrated to %s: %v", TokenPath(root), err)
+	}
+	if !HasToken(root) {
+		t.Fatal("HasToken false after migration")
 	}
 }
