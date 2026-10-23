@@ -3,7 +3,8 @@
 #   curl -fsSLO https://raw.githubusercontent.com/baovo15/gtb/feat/gtb-reshape/scripts/install-mac.mk
 #   make -f install-mac.mk all CODE=<enrollment-code> WORKSPACE=<folder>
 #
-# WORKSPACE holds the source clone (gtb-test/) and the town (gtb-town/).
+# WORKSPACE (default: the current folder) holds the source clone (gtb-test/)
+# and the town (gtb-town/). Run every target from that folder, or pass WORKSPACE=.
 # Every step is safe to re-run. `all` traces each command and writes a log
 # to $(LOG); show it with `make -f install-mac.mk log`.
 # Single targets: deps, build, town, join, status, item REPO=<url>,
@@ -12,7 +13,7 @@
 # Written for the GNU make 3.81 that macOS ships: no .SHELLFLAGS, so each
 # recipe starts with $(SH) for errexit/pipefail (and xtrace under TRACE=1).
 
-WORKSPACE ?= $(HOME)/gtb
+WORKSPACE ?= $(CURDIR)
 SERVER    ?= https://gtb.nhaboc.com
 BRANCH    ?= feat/gtb-reshape
 REPO_URL  ?= https://github.com/baovo15/gtb.git
