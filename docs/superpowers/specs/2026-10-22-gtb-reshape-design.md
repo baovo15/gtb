@@ -181,7 +181,11 @@ All requests come from the maintainer's logged-in browser session. Machines neve
 - **Process:** `gtb server` is a new subcommand in the same binary **(proposal)**. It runs in k3s, in namespace `gtb`, from the existing `deploy/k3s/gtb.yaml` and `scripts/gtb-deploy.sh`. The pod changes from "Gas Town plus a Dolt pod" to "gtb server plus its store", and runs no agents.
 - **Server store:** the server's own database of machines, rigs, item projections, evidence summaries, events, enrollment codes and sessions. Choosing SQLite on the PVC or the existing Dolt pod is left to the builder.
 - **Auth:**
-  - The maintainer logs in to the dashboard with GitHub OAuth, restricted to `baovo15`, plus a session cookie **(proposal)**.
+  - The maintainer logs in with an **admin token**, not GitHub OAuth **(maintainer, 2026-10-23: "we don't need OAuth app, when start pod in k3s give me the token")**.
+    - On first start, the server generates a 256-bit random admin token. It stores only the sha256 and prints the plain token once to the pod log, framed so `kubectl logs` shows it clearly.
+    - The token can also be supplied via the env var `GTB_ADMIN_TOKEN` (for example from a k3s Secret). In that case nothing is printed.
+    - `gtb server admin-token --rotate` replaces the token and prints the new one.
+    - The login page takes the token and exchanges it for an HttpOnly session cookie, plus a CSRF token for writes.
   - Machines use machine tokens.
   - The dashboard is reachable only on the tailnet, as all of `*.nhaboc.com` is.
   - Machines are assumed to be on the tailnet too. Tokens and TLS are still required, so a machine could later connect from outside without a redesign **(proposal)**.
