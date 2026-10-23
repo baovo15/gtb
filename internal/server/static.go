@@ -8,12 +8,15 @@ import (
 	"strings"
 )
 
-// distFS holds the built dashboard UI. The UI build (Task 16) copies its
-// output into internal/server/dist/; the committed placeholder index.html
-// says "UI not built".
+// distFS holds the built dashboard UI. `make web` copies web/dist into
+// internal/server/dist/, which git keeps empty (only .keep). Without a build
+// the server serves placeholderHTML, which says "UI not built".
 //
 //go:embed all:dist
 var distFS embed.FS
+
+//go:embed placeholder.html
+var placeholderHTML []byte
 
 func uiFS() fs.FS {
 	sub, err := fs.Sub(distFS, "dist")
@@ -48,8 +51,7 @@ func (a *App) serveStatic(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := fs.ReadFile(a.ui, "index.html")
 	if err != nil {
-		http.Error(w, "UI not built", http.StatusNotFound)
-		return
+		b = placeholderHTML
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

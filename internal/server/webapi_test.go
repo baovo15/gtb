@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/agentlink"
@@ -454,6 +455,7 @@ func TestWebAPI_MachinesEnrollRevoke(t *testing.T) {
 
 func TestStatic_SPAFallbackAndAPI404(t *testing.T) {
 	f := newWebFixture(t)
+	f.app.ui = fstest.MapFS{} // no UI build: the placeholder is served
 	rec := f.serve(httptest.NewRequest(http.MethodGet, "/items/x/y", nil))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Header().Get("Content-Type"), "text/html") || !strings.Contains(rec.Body.String(), "UI not built") {
 		t.Fatalf("SPA fallback: %d %q %q", rec.Code, rec.Header().Get("Content-Type"), rec.Body.String())

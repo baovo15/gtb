@@ -1,4 +1,4 @@
-.PHONY: build desktop-build desktop-run install safe-install check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
+.PHONY: build web web-notice desktop-build desktop-run install safe-install check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
 
 BINARY := gtb
 # LEGACY_LINK is a symlink to $(BINARY) kept during migration from gt.
@@ -33,6 +33,27 @@ ifeq ($(shell uname),Darwin)
     export CGO_LDFLAGS  += -L$(ICU_PREFIX)/lib
   endif
 endif
+
+# The dashboard (web/) is embedded from internal/server/dist. `build` runs
+# `web` first when bun is on PATH; otherwise the server serves its
+# "UI not built" placeholder.
+HAVE_BUN := $(shell command -v bun 2>/dev/null)
+
+web:
+	cd web && bun install --frozen-lockfile && bun run build
+	rm -rf internal/server/dist
+	mkdir -p internal/server/dist
+	cp -r web/dist/. internal/server/dist/
+	touch internal/server/dist/.keep
+
+ifeq ($(HAVE_BUN),)
+build: web-notice
+else
+build: web
+endif
+
+web-notice:
+	@echo "bun not found: building gtb with the 'UI not built' placeholder (install bun and run 'make web' for the dashboard)"
 
 build:
 	@# cmd/gt-proxy-server and cmd/gt-proxy-client are upstream-only (spec §9):
