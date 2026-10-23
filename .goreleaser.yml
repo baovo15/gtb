@@ -71,26 +71,20 @@ changelog:
 
 release:
   github:
-    owner: gastownhall
-    name: gastown
+    owner: baovo15
+    name: gtb
   draft: false
   prerelease: auto
   replace_existing_artifacts: true
   name_template: "v{{.Version}}"
   header: |
-    ## Gas Town v{{.Version}}
+    ## gtb v{{.Version}}
 
     Pre-compiled `gtb` binaries for Linux and macOS (amd64 & arm64).
 
     ### Installation
 
-    **Homebrew (macOS/Linux):**
-    ```bash
-    brew install gastown
-    ```
-
-    **Manual Install:**
-    Download the appropriate binary for your platform below, extract it, and place it in your PATH.
+    Download the archive for your platform below, verify it against `checksums.txt`, extract it, and place `gtb` in your PATH.
 
 # Announce the release
 announce:
