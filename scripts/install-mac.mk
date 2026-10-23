@@ -7,7 +7,8 @@
 # and the town (gtb-town/). Run every target from that folder, or pass WORKSPACE=.
 # Every step is safe to re-run. `all` traces each command and writes a log
 # to $(LOG); show it with `make -f install-mac.mk log`.
-# Single targets: deps, build, town, join, status, item REPO=<url>,
+# Single targets: deps, build, town, join, status, item REPO=<url> (adds the
+# rig, enables its gated workflow, creates one task),
 # advance ID=<id>, clean-town.
 #
 # Written for the GNU make 3.81 that macOS ships: no .SHELLFLAGS, so each
@@ -20,6 +21,8 @@ REPO_URL  ?= https://github.com/baovo15/gtb.git
 LOG       ?= $(WORKSPACE)/gtb-test.log
 # DOLT_PORT: set when another Dolt already holds 3307 (e.g. DOLT_PORT=3308).
 DOLT_PORT ?=
+# RIG: the test rig that item/advance use.
+RIG       ?= demo
 
 SRC  := $(WORKSPACE)/gtb-test
 GTB  := $(SRC)/gtb
@@ -96,11 +99,20 @@ status:
 
 item:
 	@[ -n "$(REPO)" ] || { echo "REPO is required: make -f install-mac.mk item REPO=<repo url without .tbb/>"; exit 1; }
-	@$(SH) cd "$(TOWN)"; "$(GTB)" rig add demo "$(REPO)"; "$(GTB)" item new task "demo"
+	@$(SH) cd "$(TOWN)"; \
+	[ -d "$(TOWN)/$(RIG)" ] || "$(GTB)" rig add "$(RIG)" "$(REPO)"; \
+	cfg="$(TOWN)/$(RIG)/settings/config.json"; \
+	if [ ! -f "$$cfg" ]; then \
+	  echo "==> enable the gated workflow: $$cfg"; mkdir -p "$$(dirname "$$cfg")"; \
+	  printf '%s\n' '{"type":"rig-settings","version":1,"workflow":{"gated":{"enabled":true}}}' > "$$cfg"; \
+	elif ! grep -q '"gated"' "$$cfg"; then \
+	  echo "$$cfg exists without workflow.gated; add \"workflow\":{\"gated\":{\"enabled\":true}} to it and re-run"; exit 1; \
+	fi; \
+	"$(GTB)" item new task "demo" --rig "$(RIG)"
 
 advance:
 	@[ -n "$(ID)" ] || { echo "ID is required: make -f install-mac.mk advance ID=<item id>"; exit 1; }
-	@cd "$(TOWN)"; "$(GTB)" item advance "$(ID)"; echo "exit code: $$?"
+	@cd "$(TOWN)"; "$(GTB)" item advance "$(ID)" --rig "$(RIG)"; echo "exit code: $$?"
 
 clean-town:
 	@echo "This deletes $(TOWN) (the test town only, not the source clone). Type yes to continue:"; \
