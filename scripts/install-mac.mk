@@ -8,13 +8,15 @@
 # Every step is safe to re-run. `all` traces each command and writes a log
 # to $(LOG); show it with `make -f install-mac.mk log`.
 # Single targets: deps, build, town, join, status, item REPO=<url> (adds the
-# rig, enables its gated workflow, creates one task),
+# rig, enables its gated workflow, creates one new task per run),
 # advance ID=<id>, clean-town.
 #
 # Written for the GNU make 3.81 that macOS ships: no .SHELLFLAGS, so each
 # recipe starts with $(SH) for errexit/pipefail (and xtrace under TRACE=1).
 
 WORKSPACE ?= $(CURDIR)
+# Absolute, so recipes that `cd` into the town still reach ./gtb-test/gtb.
+override WORKSPACE := $(abspath $(WORKSPACE))
 SERVER    ?= https://gtb.nhaboc.com
 BRANCH    ?= feat/gtb-reshape
 REPO_URL  ?= https://github.com/baovo15/gtb.git
@@ -65,7 +67,7 @@ build: deps
 	cd "$(SRC)"; git fetch -q origin; git checkout -q "$(BRANCH)"; git pull -q --ff-only; \
 	echo "==> build gtb (pure Go, no ICU)"; \
 	CGO_ENABLED=0 go build -tags gms_pure_go \
-	  -ldflags "-X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1 -X github.com/steveyegge/gastown/internal/cmd.Version=$$(git describe --tags --always)" \
+	  -ldflags "-X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1 -X github.com/steveyegge/gastown/internal/cmd.Version=$$(git describe --tags --always) -X github.com/steveyegge/gastown/internal/cmd.Build=$$(git rev-parse --short HEAD) -X github.com/steveyegge/gastown/internal/cmd.Commit=$$(git rev-parse HEAD) -X github.com/steveyegge/gastown/internal/cmd.Branch=$$(git rev-parse --abbrev-ref HEAD)" \
 	  -o gtb ./cmd/gtb; \
 	"$(GTB)" version
 
@@ -98,7 +100,7 @@ status:
 	@echo "==> done: check the Machines page at $(SERVER)"
 
 item:
-	@[ -n "$(REPO)" ] || { echo "REPO is required: make -f install-mac.mk item REPO=<repo url without .tbb/>"; exit 1; }
+	@[ -n "$(REPO)" ] || { echo "REPO is required: make -f install-mac.mk item REPO=<repo url without .tbb/> (creates one new task per run)"; exit 1; }
 	@$(SH) cd "$(TOWN)"; \
 	[ -d "$(TOWN)/$(RIG)" ] || "$(GTB)" rig add "$(RIG)" "$(REPO)"; \
 	cfg="$(TOWN)/$(RIG)/settings/config.json"; \
