@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -39,15 +40,17 @@ type AgentAPI struct {
 
 // NewAgentAPI returns the handler for every /agent/v1/ route, including
 // POST /agent/v1/enroll (delegated to st.EnrollHandler). now is the clock
-// used wherever the API reasons about time; nil means time.Now.
-func NewAgentAPI(st *Store, now func() time.Time) http.Handler {
+// used wherever the API reasons about time; nil means time.Now. trusted lists
+// reverse proxies whose X-Forwarded-For identifies the client for the enroll
+// limiter (see clientIP).
+func NewAgentAPI(st *Store, now func() time.Time, trusted ...netip.Prefix) http.Handler {
 	if now == nil {
 		now = time.Now
 	}
 	return &AgentAPI{
 		store:   st,
 		now:     now,
-		enroll:  st.EnrollHandler(now),
+		enroll:  st.EnrollHandler(now, trusted...),
 		maxWait: defaultMaxWait,
 		recheck: defaultRecheck,
 	}

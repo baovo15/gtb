@@ -127,6 +127,47 @@ func TestServerRun_ShortEnvTokenRefused(t *testing.T) {
 	}
 }
 
+func TestServerRun_InvalidTrustedProxyRefused(t *testing.T) {
+	setServerFlags(t, t.TempDir(), "http://127.0.0.1", false)
+	t.Setenv("GTB_ADMIN_TOKEN", "")
+	oldListen, oldTrusted := serverListen, serverTrusted
+	serverListen = "127.0.0.1:0"
+	t.Cleanup(func() { serverListen, serverTrusted = oldListen, oldTrusted })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverTrusted = []string{"10.0.0.0/8", "10.0.0.0/99"}
+	t.Setenv("GTB_TRUSTED_PROXIES", "")
+	var buf bytes.Buffer
+	if err := runServerCtx(ctx, &buf, &buf); err == nil || !strings.Contains(err.Error(), "10.0.0.0/99") {
+		t.Fatalf("flag: err = %v", err)
+	}
+	serverTrusted = nil
+	t.Setenv("GTB_TRUSTED_PROXIES", "10.0.0.0/8, bogus")
+	if err := runServerCtx(ctx, &buf, &buf); err == nil || !strings.Contains(err.Error(), "bogus") {
+		t.Fatalf("env: err = %v", err)
+	}
+	if strings.Contains(buf.String(), "admin token") {
+		t.Fatal("token printed before refusing")
+	}
+}
+
+func TestServerTrustedProxies_FlagAndEnv(t *testing.T) {
+	old := serverTrusted
+	t.Cleanup(func() { serverTrusted = old })
+	serverTrusted = []string{"10.0.0.0/8"}
+	t.Setenv("GTB_TRUSTED_PROXIES", "192.168.0.0/16,fd00::/8")
+	ps, err := trustedProxies()
+	if err != nil || len(ps) != 3 {
+		t.Fatalf("ps = %v, %v", ps, err)
+	}
+	serverTrusted = nil
+	t.Setenv("GTB_TRUSTED_PROXIES", "")
+	if ps, err := trustedProxies(); err != nil || len(ps) != 0 {
+		t.Fatalf("default: %v, %v", ps, err)
+	}
+}
+
 func TestServerRun_ServesHealthAndStops(t *testing.T) {
 	setServerFlags(t, t.TempDir(), "http://127.0.0.1", false)
 	t.Setenv("GTB_ADMIN_TOKEN", "")
@@ -157,6 +198,9 @@ func TestServerRun_ServesHealthAndStops(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("health: %d", resp.StatusCode)
+	}
+	if strings.Contains(logs.String(), "not https") {
+		t.Fatalf("loopback listen warned: %q", logs.String())
 	}
 	if !strings.Contains(out.String(), "gtb dashboard admin token (shown once; store it safely):") {
 		t.Fatalf("frame not printed: %q", out.String())

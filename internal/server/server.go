@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 )
@@ -32,6 +33,10 @@ type Config struct {
 	// PublicURL is the dashboard's public base URL. An https:// URL makes the
 	// session cookie Secure.
 	PublicURL string
+	// TrustedProxies are reverse proxies whose X-Forwarded-For identifies
+	// the client for the login and enroll limiters (R41). Empty means the
+	// immediate peer is always the client.
+	TrustedProxies []netip.Prefix
 }
 
 // App serves every route of the gtb server: /agent/v1/ (machines), /login,
@@ -43,6 +48,7 @@ type App struct {
 	agent        http.Handler
 	ui           fs.FS
 	loginLimiter *failureLimiter
+	trusted      []netip.Prefix
 	mux          *http.ServeMux // /api/v1 routes
 
 	// termPoll and termWait control how GET .../terminal polls for the
@@ -64,7 +70,8 @@ func NewApp(c Config) *App {
 		store:        c.Store,
 		now:          now,
 		publicURL:    strings.TrimRight(c.PublicURL, "/"),
-		agent:        NewAgentAPI(c.Store, now),
+		agent:        NewAgentAPI(c.Store, now, c.TrustedProxies...),
+		trusted:      c.TrustedProxies,
 		ui:           uiFS(),
 		loginLimiter: newFailureLimiter(loginMaxFailures, loginFailWindow),
 		termPoll:     defaultTermPoll,
@@ -162,9 +169,10 @@ func NewHTTPServer(addr string, h http.Handler) *http.Server {
 
 // ServeOptions configures Serve.
 type ServeOptions struct {
-	Listen    string
-	PublicURL string
-	Logf      func(string, ...any)
+	Listen         string
+	PublicURL      string
+	TrustedProxies []netip.Prefix
+	Logf           func(string, ...any)
 	// Ready, when set, is called with the bound address once listening.
 	Ready func(addr string)
 }
@@ -181,7 +189,10 @@ func Serve(ctx context.Context, st *Store, o ServeOptions) error {
 	if err != nil {
 		return fmt.Errorf("server: listen %s: %w", o.Listen, err)
 	}
-	app := NewApp(Config{Store: st, PublicURL: o.PublicURL})
+	if publicURLInsecure(o.PublicURL, o.Listen) {
+		logf("warning: public URL is not https; session cookies will not be marked Secure")
+	}
+	app := NewApp(Config{Store: st, PublicURL: o.PublicURL, TrustedProxies: o.TrustedProxies})
 	srv := NewHTTPServer(o.Listen, app)
 	srv.BaseContext = func(net.Listener) context.Context { return ctx }
 

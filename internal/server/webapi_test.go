@@ -61,6 +61,16 @@ func TestWebAPI_ApproveRequiresSession(t *testing.T) {
 		req.Header.Set("X-CSRF-Token", s.csrf)
 		wantError(t, f.serve(req), http.StatusForbidden, "bearer_not_allowed")
 
+		// Any Authorization header, whatever its scheme, case or separator,
+		// is refused even with a valid session and CSRF.
+		for _, auth := range []string{"Bearer\t" + tok, "bearer " + tok, "  BEARER  " + tok, "Basic Zm9vOmJhcg==", "Token x", tok} {
+			req = httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"artifact":"spec","sha":"`+strings.Repeat("a", 64)+`"}`))
+			req.Header.Set("Authorization", auth)
+			req.AddCookie(&http.Cookie{Name: sessionCookie, Value: s.cookie.Value})
+			req.Header.Set("X-CSRF-Token", s.csrf)
+			wantError(t, f.serve(req), http.StatusForbidden, "bearer_not_allowed")
+		}
+
 		// No credentials: 401.
 		wantError(t, f.api(http.MethodPost, path, nil, body), http.StatusUnauthorized, "unauthorized")
 	}

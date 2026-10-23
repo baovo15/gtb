@@ -74,7 +74,7 @@ func (a *App) toWebItem(r ItemRow, now time.Time) webItem {
 // Route flags.
 const (
 	routeMutating = 1 << iota // needs X-CSRF-Token
-	routeNoBearer             // refused with 403 when Authorization: Bearer is present
+	routeNoBearer             // refused with 403 when any Authorization header is present
 )
 
 type apiHandler func(a *App, w http.ResponseWriter, r *http.Request, sessionID string)
@@ -111,12 +111,25 @@ func (a *App) serveAPI(w http.ResponseWriter, r *http.Request) {
 	a.mux.ServeHTTP(w, r)
 }
 
-// guard enforces auth for one route: Bearer refusal (approvals), then a valid
+// hasAuthorization reports whether the request carries any non-blank
+// Authorization header.
+func hasAuthorization(r *http.Request) bool {
+	for _, v := range r.Header.Values("Authorization") {
+		if strings.TrimSpace(v) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// guard enforces auth for one route: refusal of any Authorization header
+// (approvals), then a valid
 // session cookie (401), then CSRF for mutating routes (403).
 func (a *App) guard(w http.ResponseWriter, r *http.Request, flags int, h apiHandler) {
 	if flags&routeNoBearer != 0 {
-		scheme, _, _ := strings.Cut(r.Header.Get("Authorization"), " ")
-		if strings.EqualFold(strings.TrimSpace(scheme), "Bearer") {
+		// Any Authorization header at all, whatever its scheme, case or
+		// separator: approvals come only from a browser session.
+		if hasAuthorization(r) {
 			writeError(w, http.StatusForbidden, "bearer_not_allowed")
 			return
 		}

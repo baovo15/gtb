@@ -268,12 +268,22 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		}
 		writeError(w, status, code)
 	}
-	ip := remoteIP(r.RemoteAddr)
+	ip := clientIP(r, a.trusted)
 	now := a.now()
-	if !a.loginLimiter.allow(ip, now) {
+	// Reserve the attempt as a failure up front so a parallel burst cannot
+	// exceed the limit. A wrong token keeps it; a success clears the
+	// client's count; anything else (bad body, internal error) releases it.
+	release, ok := a.loginLimiter.reserve(ip, now)
+	if !ok {
 		fail(http.StatusTooManyRequests, "too_many_attempts", "Too many attempts. Try again later.")
 		return
 	}
+	counted := false
+	defer func() {
+		if !counted {
+			release()
+		}
+	}()
 	r.Body = http.MaxBytesReader(w, r.Body, loginMaxBody)
 	var token string
 	if form {
@@ -299,7 +309,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 	}
 	got := sha256Hex(token)
 	if adm == nil || token == "" || subtle.ConstantTimeCompare([]byte(got), []byte(adm.TokenSHA)) != 1 {
-		a.loginLimiter.fail(ip, now)
+		counted = true
 		fail(http.StatusUnauthorized, "invalid_token", "Invalid token.")
 		return
 	}
@@ -308,6 +318,8 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		fail(http.StatusInternalServerError, "internal", "Internal error.")
 		return
 	}
+	counted = true // cleared below; nothing to release
+	a.loginLimiter.clear(ip)
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    id,

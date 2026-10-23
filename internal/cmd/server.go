@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -24,6 +26,7 @@ var (
 	serverData      string
 	serverPublicURL string
 	serverRotate    bool
+	serverTrusted   []string
 
 	// serverReady, when set (tests), is called with the bound address.
 	serverReady func(addr string)
@@ -43,6 +46,10 @@ not set, the server generates one and prints it once to stdout. If
 GTB_ADMIN_TOKEN is set (at least 32 characters), its hash is stored and
 nothing is printed; a different GTB_ADMIN_TOKEN on a later start replaces
 the stored token. Use 'gtb server admin-token --rotate' to replace it.
+
+Behind a reverse proxy, pass its address range with --trusted-proxy (repeatable)
+or GTB_TRUSTED_PROXIES (comma-separated CIDRs) so login and enrollment rate
+limits apply per client (from X-Forwarded-For) rather than to the proxy.
 
 The server stops gracefully on SIGTERM or SIGINT.`,
 	Args:         cobra.NoArgs,
@@ -72,6 +79,7 @@ func init() {
 	serverCmd.Flags().StringVar(&serverListen, "listen", ":8080", "Address to listen on")
 	serverCmd.PersistentFlags().StringVar(&serverData, "data", "/data", "Data directory (the store is <data>/gtb.db)")
 	serverCmd.PersistentFlags().StringVar(&serverPublicURL, "public-url", "http://localhost:8080", "Public base URL of the dashboard (https makes cookies Secure)")
+	serverCmd.Flags().StringArrayVar(&serverTrusted, "trusted-proxy", nil, "CIDR of a reverse proxy whose X-Forwarded-For is trusted (repeatable; also GTB_TRUSTED_PROXIES)")
 	serverAdminTokenCmd.Flags().BoolVar(&serverRotate, "rotate", false, "Generate and print a new admin token, revoking all sessions")
 	serverCmd.AddCommand(serverAdminTokenCmd)
 	rootCmd.AddCommand(serverCmd)
@@ -92,6 +100,10 @@ func runServerCtx(ctx context.Context, out, errOut io.Writer) error {
 	if envToken != "" && len(envToken) < server.MinAdminTokenLen {
 		return fmt.Errorf("GTB_ADMIN_TOKEN must be at least %d characters; refusing to start", server.MinAdminTokenLen)
 	}
+	trusted, err := trustedProxies()
+	if err != nil {
+		return err
+	}
 	st, err := openServerStore()
 	if err != nil {
 		return err
@@ -101,11 +113,25 @@ func runServerCtx(ctx context.Context, out, errOut io.Writer) error {
 		return err
 	}
 	return server.Serve(ctx, st, server.ServeOptions{
-		Listen:    serverListen,
-		PublicURL: serverPublicURL,
-		Logf:      logger.Printf,
-		Ready:     serverReady,
+		Listen:         serverListen,
+		PublicURL:      serverPublicURL,
+		TrustedProxies: trusted,
+		Logf:           logger.Printf,
+		Ready:          serverReady,
 	})
+}
+
+// trustedProxies parses --trusted-proxy and GTB_TRUSTED_PROXIES together.
+func trustedProxies() ([]netip.Prefix, error) {
+	all := append([]string{}, serverTrusted...)
+	if env := os.Getenv("GTB_TRUSTED_PROXIES"); env != "" {
+		all = append(all, strings.Split(env, ",")...)
+	}
+	ps, err := server.ParseTrustedProxies(all)
+	if err != nil {
+		return nil, fmt.Errorf("%w; refusing to start", err)
+	}
+	return ps, nil
 }
 
 func runServerAdminToken(cmd *cobra.Command, _ []string) error {

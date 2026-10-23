@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -122,18 +123,20 @@ type EnrollResponse struct {
 }
 
 // EnrollHandler returns the handler for POST /agent/v1/enroll. now is the
-// clock used for code expiry and the failure limiter. The handler never logs
-// codes or tokens.
-func (s *Store) EnrollHandler(now func() time.Time) http.Handler {
+// clock used for code expiry and the failure limiter (nil means time.Now).
+// trusted lists reverse proxies whose X-Forwarded-For identifies the client
+// for the limiter (see clientIP). The handler never logs codes or tokens.
+func (s *Store) EnrollHandler(now func() time.Time, trusted ...netip.Prefix) http.Handler {
 	if now == nil {
 		now = time.Now
 	}
-	return &enrollAPI{store: s, now: now, limiter: newFailureLimiter(enrollMaxFailures, enrollFailWindow)}
+	return &enrollAPI{store: s, now: now, trusted: trusted, limiter: newFailureLimiter(enrollMaxFailures, enrollFailWindow)}
 }
 
 type enrollAPI struct {
 	store   *Store
 	now     func() time.Time
+	trusted []netip.Prefix
 	limiter *failureLimiter
 }
 
@@ -154,12 +157,21 @@ func (a *enrollAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
 	}
-	ip := remoteIP(r.RemoteAddr)
+	ip := clientIP(r, a.trusted)
 	now := a.now()
-	if !a.limiter.allow(ip, now) {
+	// The attempt is reserved as a failure up front, so a parallel burst
+	// cannot exceed the limit. Every outcome but an invalid code releases it.
+	release, ok := a.limiter.reserve(ip, now)
+	if !ok {
 		writeError(w, http.StatusTooManyRequests, "too_many_attempts")
 		return
 	}
+	counted := false
+	defer func() {
+		if !counted {
+			release()
+		}
+	}()
 
 	var req EnrollRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, enrollMaxBody))
@@ -194,7 +206,7 @@ func (a *enrollAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	err = a.store.consumeEnrollCode(req.Code, machineID, sha256Hex(token), hello, now)
 	if errors.Is(err, errInvalidCode) {
-		a.limiter.fail(ip, now)
+		counted = true
 		writeError(w, http.StatusUnauthorized, "invalid_code")
 		return
 	}
@@ -275,15 +287,45 @@ func (l *failureLimiter) sweep(now time.Time) {
 	}
 }
 
-func (l *failureLimiter) allow(key string, now time.Time) bool {
+// reserve atomically checks the limit for key and, if under it, records an
+// attempt at now as a failure. It returns ok=false (nothing recorded) when
+// key is at the limit. Call release to take the reserved attempt back when
+// it turns out not to be a failure; release is idempotent and safe after the
+// entry has aged out.
+func (l *failureLimiter) reserve(key string, now time.Time) (release func(), ok bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.sweep(now)
-	return len(l.prune(key, now)) < l.max
+	fs := l.prune(key, now)
+	if len(fs) >= l.max {
+		return func() {}, false
+	}
+	l.failures[key] = append(fs, now)
+	var once sync.Once
+	return func() { once.Do(func() { l.remove(key, now) }) }, true
 }
 
-func (l *failureLimiter) fail(key string, now time.Time) {
+// remove drops one failure for key recorded at t.
+func (l *failureLimiter) remove(key string, t time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.failures[key] = append(l.prune(key, now), now)
+	fs := l.failures[key]
+	for i := len(fs) - 1; i >= 0; i-- {
+		if fs[i].Equal(t) {
+			fs = append(fs[:i:i], fs[i+1:]...)
+			break
+		}
+	}
+	if len(fs) == 0 {
+		delete(l.failures, key)
+		return
+	}
+	l.failures[key] = fs
+}
+
+// clear forgets every failure for key.
+func (l *failureLimiter) clear(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.failures, key)
 }
