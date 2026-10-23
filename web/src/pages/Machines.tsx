@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, errorText, revalidate } from "../api";
+import { api, BACKSTOP_MS, errorText, revalidate } from "../api";
 import { useMachines } from "../App";
 import { Freshness } from "../components/Freshness";
 import { useToast } from "../components/Toast";
@@ -63,7 +63,7 @@ function RevokeButton({ m }: { m: Machine }) {
 }
 
 export function Machines() {
-  const machines = useMachines();
+  const machines = useMachines({ refreshInterval: BACKSTOP_MS });
   const list = machines.data;
   return (
     <div>

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
-import { itemPath, useApi } from "../api";
+import { BACKSTOP_MS, itemPath, useApi } from "../api";
 import { machineNames, useMachines } from "../App";
 import { ApproveBar } from "../components/ApproveBar";
 import { Freshness } from "../components/Freshness";
@@ -96,13 +96,21 @@ function Overview({ d }: { d: ItemDetail }) {
 // Artifacts pins the version of each artifact the user opened (name, sha,
 // content). A live refetch that brings a newer sha does not replace what is
 // on screen or what Approve posts: a banner offers to load it, and approving
-// the pinned sha gets stale_sha from the machine (R43). The component is
-// keyed by item, so pins never cross items.
+// the pinned sha gets stale_sha from the machine (R43). If the pinned
+// artifact disappears from the latest data, a banner says so and approval is
+// disabled (R45). The component is keyed by item, so pins never cross items.
 function Artifacts({ d, machine }: { d: ItemDetail; machine: string }) {
   const [params, setParams] = useSearchParams();
   const [pins, setPins] = useState<Record<string, ArtifactView>>({});
-  const selName = params.get("artifact") ?? d.artifacts[0]?.name ?? "";
-  const latest = d.artifacts.find((a) => a.name === selName) ?? (params.get("artifact") ? undefined : d.artifacts[0]);
+  // The artifact first shown without ?artifact= stays selected even if the
+  // list changes under it.
+  const [defaultName, setDefaultName] = useState<string | undefined>(d.artifacts[0]?.name);
+  const first = d.artifacts[0]?.name;
+  useEffect(() => {
+    if (defaultName === undefined && first !== undefined) setDefaultName(first);
+  }, [defaultName, first]);
+  const selName = params.get("artifact") ?? defaultName ?? "";
+  const latest = d.artifacts.find((a) => a.name === selName);
   const pinned = pins[selName] ?? latest;
 
   useEffect(() => {
@@ -110,6 +118,7 @@ function Artifacts({ d, machine }: { d: ItemDetail; machine: string }) {
   }, [latest, pins]);
 
   if (!pinned) return <Empty>{d.artifacts.length === 0 ? "No artifacts yet." : `No artifact named ${selName}.`}</Empty>;
+  const gone = latest === undefined;
   const newer = latest && latest.sha !== pinned.sha ? latest : null;
 
   function open(a: ArtifactView) {
@@ -144,6 +153,11 @@ function Artifacts({ d, machine }: { d: ItemDetail; machine: string }) {
         ))}
       </ul>
       <div className="flex min-w-0 flex-1 flex-col gap-3">
+        {gone && (
+          <div role="status" className="rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950 dark:text-red-200">
+            {pinned.name} is no longer on the machine.
+          </div>
+        )}
         {newer && (
           <div role="status" className="flex flex-wrap items-center gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
             <span>A newer version of {pinned.name} is on the machine.</span>
@@ -156,7 +170,7 @@ function Artifacts({ d, machine }: { d: ItemDetail; machine: string }) {
             </button>
           </div>
         )}
-        <ApproveBar key={`${pinned.name}@${pinned.sha}`} machine={machine} itemId={d.item.id} artifact={pinned} />
+        <ApproveBar key={`${pinned.name}@${pinned.sha}`} machine={machine} itemId={d.item.id} artifact={pinned} disabled={gone} />
         <article className="rounded-md border border-zinc-200 p-4 dark:border-zinc-800">
           <Markdown source={pinned.content} />
         </article>
@@ -266,7 +280,7 @@ export function Item() {
   const [params, setParams] = useSearchParams();
   const raw = params.get("tab");
   const tab: TabId = TABS.some((t) => t.id === raw) ? (raw as TabId) : "overview";
-  const detail = useApi<ItemDetail>(itemPath(machine, id));
+  const detail = useApi<ItemDetail>(itemPath(machine, id), { refreshInterval: BACKSTOP_MS });
   const machines = useMachines();
   const names = useMemo(() => machineNames(machines.data), [machines.data]);
 

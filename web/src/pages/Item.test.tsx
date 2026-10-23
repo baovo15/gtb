@@ -1,9 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { act, screen, waitFor } from "@testing-library/react";
 import { timing } from "../api";
 import userEvent from "@testing-library/user-event";
 import { renderAt } from "../test/render";
-import { item, mockFetch, MockEventSource, SHA, type Handler, type Reply } from "../test/mocks";
+import { hideable, item, mockFetch, MockEventSource, SHA, type Handler, type Reply } from "../test/mocks";
 
 function detail() {
   return {
@@ -187,6 +187,75 @@ describe("Item", () => {
       expect(screen.queryByText(banner)).toBeNull();
       await userEvent.click(screen.getByRole("button", { name: "Approve" }));
       expect(calls.find((c) => c.method === "POST")!.body).toEqual({ artifact: "spec", sha: B });
+    });
+
+    it("disables approval when the pinned artifact was deleted on the machine", async () => {
+      let n = 0;
+      const calls = setup(null, {
+        "GET /api/v1/items/m1/gt-1": () => {
+          const d = detail();
+          d.artifacts = n++ === 0 ? [{ name: "spec", sha: SHA, content: "Version A" }, { name: "plan", sha: B, content: "The plan" }] : [{ name: "plan", sha: B, content: "The plan" }];
+          return { body: d };
+        },
+      });
+      renderAt("/items/m1/gt-1?tab=artifacts");
+      expect(await screen.findByText("Version A")).toBeInTheDocument();
+      act(() => MockEventSource.instances[0].emit("board.changed"));
+      expect(await screen.findByText("spec is no longer on the machine.")).toBeInTheDocument();
+      expect(screen.getByText("Version A")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Approve" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Request changes" })).toBeDisabled();
+      expect(calls.some((c) => c.method === "POST")).toBe(false);
+    });
+  });
+
+  describe("backstop revalidation (R45)", () => {
+    const itemFetches = (calls: ReturnType<typeof setup>) => calls.filter((c) => c.path === "/api/v1/items/m1/gt-1").length;
+    const advance = (ms: number) =>
+      act(async () => {
+        vi.advanceTimersByTime(ms);
+      });
+
+    it("refetches the item every 60 s with no SSE", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const calls = setup(null);
+      renderAt("/items/m1/gt-1");
+      await screen.findByRole("tablist");
+      expect(itemFetches(calls)).toBe(1);
+      await advance(59_000);
+      expect(itemFetches(calls)).toBe(1);
+      await advance(1_000);
+      await waitFor(() => expect(itemFetches(calls)).toBe(2));
+    });
+
+    it("does not refetch while the page is hidden, and catches up when shown", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const vis = hideable();
+      const calls = setup(null);
+      renderAt("/items/m1/gt-1");
+      await screen.findByRole("tablist");
+      vis.set("hidden");
+      await advance(180_000);
+      expect(itemFetches(calls)).toBe(1);
+      vis.set("visible");
+      await waitFor(() => expect(itemFetches(calls)).toBe(2));
+      vis.restore();
+    });
+
+    it("an SSE revalidate at 50 s moves the next backstop fetch to 110 s", async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      const calls = setup(null);
+      renderAt("/items/m1/gt-1");
+      await screen.findByRole("tablist");
+      await advance(50_000);
+      act(() => MockEventSource.instances[0].emit("board.changed"));
+      await waitFor(() => expect(itemFetches(calls)).toBe(2));
+      await advance(10_000); // t = 60 s: no backstop fetch
+      expect(itemFetches(calls)).toBe(2);
+      await advance(49_000); // t = 109 s
+      expect(itemFetches(calls)).toBe(2);
+      await advance(1_000); // t = 110 s
+      await waitFor(() => expect(itemFetches(calls)).toBe(3));
     });
   });
 });

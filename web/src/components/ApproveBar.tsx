@@ -34,7 +34,7 @@ const toneClass = {
 const btn =
   "rounded-md px-3 py-1.5 text-sm font-medium focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50";
 
-export function ApproveBar({ machine, itemId, artifact }: { machine: string; itemId: string; artifact: ArtifactView }) {
+export function ApproveBar({ machine, itemId, artifact, disabled = false }: { machine: string; itemId: string; artifact: ArtifactView; disabled?: boolean }) {
   const [state, setState] = useState<State>({ kind: "idle" });
   const ctl = useRef<AbortController | null>(null);
   useEffect(() => () => ctl.current?.abort(), []);
@@ -63,6 +63,7 @@ export function ApproveBar({ machine, itemId, artifact }: { machine: string; ite
   }
 
   const pending = state.kind === "pending";
+  const off = pending || disabled;
   return (
     <div className="flex flex-wrap items-center gap-3 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 dark:border-zinc-800 dark:bg-zinc-900">
       <span className="text-xs text-zinc-500">
@@ -73,10 +74,10 @@ export function ApproveBar({ machine, itemId, artifact }: { machine: string; ite
           {pending && <span className="text-zinc-500">Waiting for machine…</span>}
           {state.kind === "message" && <span className={toneClass[state.tone]}>{state.text}</span>}
         </span>
-        <button type="button" className={`${btn} border border-zinc-300 bg-white text-zinc-800 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700`} disabled={pending} onClick={() => act("request-changes")}>
+        <button type="button" className={`${btn} border border-zinc-300 bg-white text-zinc-800 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700`} disabled={off} onClick={() => act("request-changes")}>
           Request changes
         </button>
-        <button type="button" className={`${btn} bg-teal-600 text-white hover:bg-teal-700`} disabled={pending} onClick={() => act("approve")}>
+        <button type="button" className={`${btn} bg-teal-600 text-white hover:bg-teal-700`} disabled={off} onClick={() => act("approve")}>
           Approve
         </button>
       </div>

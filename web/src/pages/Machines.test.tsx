@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderAt } from "../test/render";
-import { mockFetch } from "../test/mocks";
+import { hideable, mockFetch } from "../test/mocks";
 
 const m = { id: "m1", hostname: "box-one", os: "linux", arch: "amd64", gtb_version: "0.1.0", protocol: "1", created_at: "2026-10-01T00:00:00Z", last_seen_at: "2026-10-22T10:00:00Z", revoked_at: null, freshness_seconds: 3, stale: false, rigs: [{ name: "core", remote: "", gated: true }] };
 
@@ -31,5 +31,25 @@ describe("Machines", () => {
       vi.advanceTimersByTime(25_000);
     });
     expect(screen.getByText("stale")).toBeInTheDocument();
+  });
+
+  it("refetches machines every 60 s with no SSE, but not while hidden", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const calls = mockFetch({ "GET /api/v1/machines": { body: [m] } });
+    const n = () => calls.filter((c) => c.path === "/api/v1/machines").length;
+    renderAt("/machines");
+    await screen.findByText("box-one");
+    expect(n()).toBe(1);
+    await act(async () => {
+      vi.advanceTimersByTime(60_000);
+    });
+    await waitFor(() => expect(n()).toBe(2));
+    const vis = hideable();
+    vis.set("hidden");
+    await act(async () => {
+      vi.advanceTimersByTime(120_000);
+    });
+    expect(n()).toBe(2);
+    vis.restore();
   });
 });

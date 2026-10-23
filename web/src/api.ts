@@ -133,9 +133,21 @@ interface ApiState<T> {
   loading: boolean;
 }
 
+export interface UseApiOptions {
+  // refreshInterval (ms) refetches as a backstop for missed SSE events. The
+  // timer restarts after every fetch, whatever triggered it (SSE, manual or
+  // the timer), pauses while the page is hidden, and on show fetches at once
+  // if a full interval has passed or else waits out the rest.
+  refreshInterval?: number;
+}
+
+// BACKSTOP_MS is the backstop refetch interval for live pages.
+export const BACKSTOP_MS = 60_000;
+
 // useApi fetches path (null: nothing) and refetches it on revalidate().
 // Data for an earlier path is not returned for a new one.
-export function useApi<T>(path: string | null) {
+export function useApi<T>(path: string | null, opts: UseApiOptions = {}) {
+  const { refreshInterval } = opts;
   const [state, setState] = useState<ApiState<T>>({ key: null, loading: path !== null });
   const [tick, setTick] = useState(0);
   const reload = useCallback(() => setTick((t) => t + 1), []);
@@ -156,6 +168,32 @@ export function useApi<T>(path: string | null) {
       ctl.abort();
     };
   }, [path, tick]);
+  useEffect(() => {
+    if (path === null || !refreshInterval) return;
+    const fetchedAt = Date.now(); // this effect reruns with every fetch (tick)
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const arm = (ms: number) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        if (!document.hidden) reload();
+      }, ms);
+    };
+    const onVis = () => {
+      if (document.hidden) {
+        clearTimeout(timer);
+        return;
+      }
+      const left = refreshInterval - (Date.now() - fetchedAt);
+      if (left <= 0) reload();
+      else arm(left);
+    };
+    if (!document.hidden) arm(refreshInterval);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [path, tick, refreshInterval, reload]);
   const mine = state.key === path;
   return {
     data: mine ? state.data : undefined,

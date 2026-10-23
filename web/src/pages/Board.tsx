@@ -1,17 +1,14 @@
 // Adapted from fabro-sh/fabro (MIT): the column layout of
 // apps/fabro-web/app/routes/runs.tsx (BoardColumnView).
-import { useEffect, useMemo, type ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import { useSearchParams } from "react-router";
-import { useApi } from "../api";
+import { BACKSTOP_MS, useApi } from "../api";
 import { machineNames, useMachines } from "../App";
 import { ItemCard } from "../components/ItemCard";
 import { InlineError, PageHeader } from "../components/ui";
 import type { Board as BoardData, ItemRow } from "../types";
 
 const KINDS = ["task", "fix", "epic"];
-
-// The board also refetches on this interval, a backstop for missed SSE events.
-export const BOARD_REVALIDATE_MS = 60_000;
 
 const selectClass =
   "rounded-md border border-zinc-300 bg-white px-2 py-1 text-sm focus-visible:outline-2 focus-visible:outline-teal-500 dark:border-zinc-700 dark:bg-zinc-900";
@@ -62,12 +59,7 @@ export function Board() {
   if (rig) q.set("rig", rig);
   if (kind) q.set("kind", kind);
   const qs = q.toString();
-  const board = useApi<BoardData>(`/api/v1/board${qs ? `?${qs}` : ""}`);
-  const { reload } = board;
-  useEffect(() => {
-    const t = setInterval(reload, BOARD_REVALIDATE_MS);
-    return () => clearInterval(t);
-  }, [reload]);
+  const board = useApi<BoardData>(`/api/v1/board${qs ? `?${qs}` : ""}`, { refreshInterval: BACKSTOP_MS });
 
   const rigOptions = useMemo(() => {
     const set = new Set<string>();

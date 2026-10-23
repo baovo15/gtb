@@ -1,5 +1,5 @@
 import { Link, NavLink, Outlet, type RouteObject } from "react-router";
-import { api, useApi } from "./api";
+import { api, useApi, type UseApiOptions } from "./api";
 import { useBoardEvents } from "./events";
 import { ToastProvider, useToast } from "./components/Toast";
 import type { Machine } from "./types";
@@ -10,8 +10,8 @@ import { Coordination } from "./pages/Coordination";
 import { Settings } from "./pages/Settings";
 
 // useMachines is the machine list, shared by pages for names and filters.
-export function useMachines() {
-  return useApi<Machine[]>("/api/v1/machines");
+export function useMachines(opts?: UseApiOptions) {
+  return useApi<Machine[]>("/api/v1/machines", opts);
 }
 
 export function machineNames(ms: Machine[] | undefined): Record<string, string> {

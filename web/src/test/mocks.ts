@@ -87,3 +87,22 @@ export function item(over: Record<string, unknown> = {}) {
     ...over,
   };
 }
+
+// hideable overrides document visibility; set() dispatches visibilitychange.
+export function hideable() {
+  let state: DocumentVisibilityState = "visible";
+  Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+  Object.defineProperty(document, "hidden", { configurable: true, get: () => state === "hidden" });
+  return {
+    set(v: DocumentVisibilityState) {
+      state = v;
+      document.dispatchEvent(new Event("visibilitychange"));
+    },
+    restore() {
+      // @ts-expect-error remove the own-property overrides (jsdom getters remain)
+      delete document.visibilityState;
+      // @ts-expect-error see above
+      delete document.hidden;
+    },
+  };
+}
